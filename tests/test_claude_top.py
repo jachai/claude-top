@@ -391,9 +391,19 @@ class CliTest(Sandbox):
         self.assertTrue(lines[4].startswith("LAST ACTIVE") and lines[4].endswith("NOTE"))
         self.assertIn("working", lines[5])
         self.assertRegex(lines[6], r"asker\s+Which one\?$")
-        self.assertIn("needs-in", lines[6])
+        self.assertIn("waiting", lines[6])
         self.assertEqual(self.run_cli("--once", "-s", "blocked", "-n", "1").stdout.count("asker"), 1)
+        self.assertEqual(self.run_cli("--once", "-s", "waiting").stdout.count("asker"), 1)
+        self.assertNotIn("writer", self.run_cli("--once", "-s", "waiting").stdout)
         self.assertNotIn("asker", self.run_cli("--once", "-g", "writer").stdout)
+
+    def test_long_note_is_cut_at_a_word(self):
+        note = "Approve the maintenance window for Saturday night or Sunday morning, whichever has less traffic"
+        self.state("b1", state="blocked", name="asker", needs=note)
+        line = self.run_cli("--once").stdout.splitlines()[5]
+        shown = line[line.index("Approve"):]
+        self.assertTrue(len(line) <= 200 and shown.endswith("…"), line)
+        self.assertEqual(note[len(shown) - 1], " ")  # the cut is at a word boundary
 
     def test_once_without_usage_data_says_how_to_get_it(self):
         self.assertIn("claude-top init", self.run_cli("--once").stdout)
@@ -412,6 +422,128 @@ class CliTest(Sandbox):
     def test_version(self):
         out = self.run_cli("--version")
         self.assertEqual(out.stdout.strip(), f"claude-top {self.ct.__version__}")
+
+
+class HelpTest(unittest.TestCase):
+    def test_help_lists_every_column_and_footer_key(self):
+        text = "\n".join(claude_top.help_lines(80))
+        for header, _ in claude_top.COLUMNS:
+            self.assertIn(header, text)
+        for key in ("enter", "c ", "o ", "f ", "/ ", "+  -", "space", "? ", "q  esc"):
+            self.assertIn("  " + key, text)
+        self.assertIn("waiting", text)
+
+    def test_help_is_two_columns_only_when_it_fits(self):
+        narrow, wide = claude_top.help_lines(80), claude_top.help_lines(200)
+        self.assertLessEqual(max(map(len, narrow)) + 4, 80)
+        self.assertLess(len(wide), len(narrow))
+        self.assertTrue(wide[0].startswith("keys") and wide[0].endswith("columns"))
+        self.assertLessEqual(max(map(len, wide)) + 4, 200)
+        self.assertEqual(claude_top.help_lines(max(map(len, wide)) + 3), narrow)
+
+    def test_box_fits_any_screen(self):
+        for rows in range(0, 40, 3):
+            for cols in range(0, 220, 7):
+                y, x, box, offset = claude_top.help_box(claude_top.help_lines(cols), rows, cols, 999)
+                self.assertTrue(y >= 0 and x >= 0 and y + len(box) <= rows)
+                self.assertTrue(all(x + len(line) <= cols for line in box))
+                self.assertEqual(len({len(line) for line in box}), 1 if box else 0)
+
+    def test_box_scrolls_when_it_overflows(self):
+        lines = claude_top.help_lines(80)
+        y, x, box, offset = claude_top.help_box(lines, 24, 80)
+        self.assertEqual((y, len(box), offset), (0, 24, 0))
+        self.assertIn("any other key closes", box[-1])
+        _, _, box, offset = claude_top.help_box(lines, 24, 80, 999)
+        self.assertEqual(offset, len(lines) - 22)
+        self.assertIn(lines[-1], box[-2])
+        _, _, box, offset = claude_top.help_box(lines, 24, 80, -5)
+        self.assertEqual(offset, 0)
+        _, _, box, _ = claude_top.help_box(claude_top.help_lines(200), 40, 200)
+        self.assertIn("─ any key closes ", box[-1])
+
+    def test_fit_cuts_at_a_word(self):
+        fit = claude_top.fit
+        self.assertEqual(fit("short", 10), "short")
+        self.assertEqual(fit("Running the integration suite", 20), "Running the…")
+        self.assertEqual(fit("one, two three", 10), "one…")
+        self.assertEqual(fit("unbreakable", 6), "unbre…")
+        self.assertEqual((fit("abc", 1), fit("abc", 0), fit("abc", -3)), ("a", "", ""))
+
+    def test_state_labels_fit_the_column(self):
+        width = dict(claude_top.COLUMNS)["STATE"]
+        self.assertTrue(all(len(label) <= width for label in claude_top.STATE_LABEL.values()))
+        self.assertEqual(claude_top.STATE_LABEL["blocked"], "waiting")
+
+
+@unittest.skipUnless(hasattr(os, "fork") and claude_top.curses, "needs a pty and curses")
+class ScreenTest(Sandbox):
+    """Drive the full-screen view in a pty: it must survive the help overlay at any size."""
+
+    @classmethod
+    def setUpClass(cls):
+        probe = [sys.executable, "-c", "import curses; curses.setupterm('xterm-256color')"]
+        if subprocess.run(probe, capture_output=True).returncode:
+            raise unittest.SkipTest("no xterm-256color terminfo")
+
+    def run_screen(self, rows, cols, keys):
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                os.environ.update(TERM="xterm-256color", PATH=str(self.home / "no-bin"))  # never reach a real `claude`
+                os.execv(sys.executable, [sys.executable, str(ROOT / "claude_top.py")])
+            finally:
+                os._exit(127)
+        out = bytearray()
+
+        def pump(seconds):
+            end = time.time() + seconds
+            while time.time() < end:
+                if select.select([fd], [], [], 0.05)[0]:
+                    try:
+                        out.extend(os.read(fd, 65536))
+                    except OSError:
+                        return
+
+        pump(0.8)
+        for key in keys:
+            try:
+                os.write(fd, key)
+            except OSError:
+                self.fail(f"claude-top exited before {key!r}: {bytes(out[-800:])!r}")
+            pump(0.2)
+        for _ in range(50):
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            pump(0.1)
+        else:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            self.fail(f"claude-top did not quit: {bytes(out[-500:])!r}")
+        os.close(fd)
+        text = bytes(out).decode(errors="replace")
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        return text
+
+    def test_help_opens_scrolls_and_closes(self):
+        self.state("b1", state="blocked", name="asker", needs="Which one?")
+        text = self.run_screen(24, 80, [b"?", b"j", b"j", b"x", b"?", b"q", b"q"])
+        self.assertIn("? help", text)
+        self.assertIn("any other key closes", text)
+        self.assertIn("this help", text)
+
+    def test_tiny_terminal_does_not_crash(self):
+        for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing
+            self.run_screen(rows, cols, [b"?", b"j", b"x", b"/", b"a\n", b"q"])
 
 
 class InitTest(Sandbox):

@@ -3,7 +3,7 @@
 
   claude-top                  full screen, refreshes every 2s
   claude-top -i 5             refresh every 5s
-  claude-top -s blocked       start filtered to sessions waiting for input
+  claude-top -s waiting       start filtered to sessions waiting for input (or -s blocked)
   claude-top -g billing       start with a text filter
   claude-top --once           print once and exit
   claude-top init             set claude-top as your Claude Code status line (--wrap keeps an existing one)
@@ -11,7 +11,7 @@
   claude-top record           same, but prints nothing (pipe your own status line's input into it)
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
-o sort, f state filter, / text filter, +/- refresh speed, space refresh now, q quit.
+o sort, f state filter, / text filter, +/- refresh speed, space refresh now, ? help, q quit.
 """
 import argparse
 import json
@@ -31,7 +31,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -50,7 +50,8 @@ SUBAGENT_IDLE_MINUTES = 15
 STATES = ["all", "review", "blocked", "working", "done", "stopped"]
 LIVE_STATES = ("working", "blocked", "review")  # done/stopped sessions keep a stale inFlight snapshot
 SORTS = ["last active", "created", "context", "agents", "name"]
-STATE_LABEL = {"review": "review", "blocked": "needs-in", "working": "working", "done": "done", "stopped": "stopped"}
+STATE_LABEL = {"review": "review", "blocked": "waiting", "working": "working", "done": "done", "stopped": "stopped"}
+STATE_ALIASES = {"waiting": "blocked"}  # -s takes Claude Code's word or the one the STATE column shows
 LIMITS = [  # rate_limits key, label, window seconds, short key
     ("five_hour", "5h", 5 * 3600, "fh"),
     ("seven_day", "week", 7 * 86400, "sd"),
@@ -79,6 +80,18 @@ def parse_ts(value):
 def clean(text):
     """Session text is shown verbatim: drop control characters so it can't drive the terminal."""
     return "".join(c if c.isprintable() else " " for c in str(text))
+
+
+def fit(text, width):
+    """text cut to width at a word boundary, with … when anything was dropped."""
+    if len(text) <= width:
+        return text
+    if width < 2:
+        return text[:max(0, width)]
+    cut = text[:width - 1]
+    if " " in cut.strip():
+        cut = cut[:cut.rstrip().rindex(" ")]
+    return cut.rstrip(" ,;:·-") + "…"
 
 
 def ago(ts, now):
@@ -672,7 +685,71 @@ def print_once(args):
         print("".join(text for text, _ in usage_segments(w, now_s))[:width])
     print(plain_line([h for h, _ in COLUMNS]) + "  NOTE")
     for r in select(rows, args.state, args.grep, "last active")[: args.n or None]:
-        print((plain_line(row_cells(r, now, args.window)) + "  " + r["note"])[:width])
+        print(row_line(row_cells(r, now, args.window), r["note"], width))
+
+
+def row_line(cells, note, width):
+    line = plain_line(cells) + "  "
+    return (line + fit(note, width - len(line)))[:width]
+
+
+# ---------------------------------------------------------------- help
+
+HELP_KEYS = [
+    ("↑ ↓  j k", "move"), ("PgUp PgDn", "page up / down"), ("g  G", "top / bottom"),
+    ("enter", "attach to the session"), ("c", "copy the attach command"), ("o", "next sort order"),
+    ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("+  -", "refresh slower / faster"),
+    ("space", "refresh now"), ("?", "this help"), ("q  esc", "quit"),
+]
+HELP_USAGE = [
+    ("5h  week", "plan used; │ marks time elapsed"), ("1.0x", "speed: lands on 100% at reset"),
+    ("now", "speed over the last few hours"), ("▶", "when you run out, or % at reset"),
+]
+HELP_COLUMNS = [
+    ("LAST ACTIVE", "when the session last did something"), ("AGO", "time since then"),
+    ("AGE", "time since it started"), ("STATE", "working, waiting (on you), review, done,"),
+    ("", "stopped; review = done, worktree still open"), ("ID", "job id, for claude attach"),
+    ("MODEL", "main thread's model"), ("EFFORT", "its reasoning effort"), ("RUN", "subagents running now"),
+    ("SPAWNED", "subagents started in total"), ("BG", "background shells, monitors, crons"),
+    ("CTX", "context tokens in use"), ("CTX %", "share of the context window (-w)"),
+    ("NAME  NOTE", "name; its question, result or step"),
+]
+
+
+def help_section(title, pairs):
+    return [title] + [f"  {k:<11}  {v}" for k, v in pairs]
+
+
+def help_lines(cols):
+    """The help text: keys and usage beside the columns when cols allows, else one after the other."""
+    left = help_section("keys", HELP_KEYS) + [""] + help_section("usage", HELP_USAGE)
+    right = help_section("columns", HELP_COLUMNS)
+    lw = max(map(len, left))
+    if lw + 4 + max(map(len, right)) + 4 <= cols:
+        right += [""] * (len(left) - len(right))
+        return [(a.ljust(lw) + "    " + b).rstrip() for a, b in zip(left, right)]
+    return left + [""] + right
+
+
+def help_box(lines, rows, cols, offset=0):
+    """The help overlay on a rows x cols screen: (y, x, box lines, offset), centered and scrolled to offset."""
+    width, height = min(max(map(len, lines)) + 4, cols), min(len(lines) + 2, rows)
+    inner_w, inner_h = width - 4, height - 2
+    if inner_w < 1 or inner_h < 1:
+        return 0, 0, [], 0
+    offset = max(0, min(offset, len(lines) - inner_h))
+    more = len(lines) > inner_h
+    label = "↑↓ scroll · any other key closes" if more else "any key closes"
+    box = [edge("┌", "help", "┐", width)]
+    box += ["│ " + line[:inner_w].ljust(inner_w) + " │" for line in lines[offset:offset + inner_h]]
+    box.append(edge("└", label, "┘", width))
+    return (rows - height) // 2, (cols - width) // 2, box, offset
+
+
+def edge(left, label, right, width):
+    fill = width - 2
+    text = f"─ {label} " if len(label) + 3 <= fill else ""
+    return left + (text + "─" * fill)[:fill] + right
 
 
 # ---------------------------------------------------------------- full screen
@@ -690,6 +767,7 @@ class Top:
         self.rows, self.view = [], []
         self.cursor = self.top = 0
         self.message = ""
+        self.help = None  # scroll offset while the help overlay is open
         self.last_load = 0.0
 
     def colors(self):
@@ -746,7 +824,7 @@ class Top:
             x = 0
             for text, level in usage_segments(win, now_s):
                 x = self.put(2 + i, x, text, self.c_level.get(level, 0))
-        flt = f" sort: {self.sort}   state: {self.state}   filter: {self.text or '-'}   showing {len(self.view)}/{len(self.rows)}"
+        flt = f" sort: {self.sort}   state: {STATE_LABEL.get(self.state, self.state)}   filter: {self.text or '-'}   showing {len(self.view)}/{len(self.rows)}"
         self.put(HEADER_ROWS - 2, 0, flt, curses.A_DIM)
         self.put(HEADER_ROWS - 1, 0, plain_line([hd for hd, _ in COLUMNS]) + "  NOTE", self.c_head)
 
@@ -759,8 +837,7 @@ class Top:
             y = HEADER_ROWS + i
             cells = row_cells(r, now, self.window)
             sel = self.top + i == self.cursor
-            self.put(y, 0, (plain_line(cells) + "  " + r["note"]).ljust(w),
-                     curses.A_REVERSE if sel else 0)
+            self.put(y, 0, row_line(cells, r["note"], w).ljust(w), curses.A_REVERSE if sel else 0)
             if sel:
                 continue
             self.put(y, COL_X["STATE"], cells[COL["STATE"]][:8], self.c_state.get(r["state"], 0))
@@ -774,10 +851,35 @@ class Top:
                 self.put(y, COL_X["CTX %"], bar(pct, 6), self.c_level[level])
 
         if self.view:
-            self.put(h - 2, 0, selected_detail(self.view[self.cursor])[:w], curses.A_DIM)
-        keys = " enter attach  c copy  o sort  f state  / filter  +/- speed  q quit"
+            self.put(h - 2, 0, fit(selected_detail(self.view[self.cursor]), w), curses.A_DIM)
+        keys = " enter attach  c copy  o sort  f state  / filter  +/- speed  ? help  q quit"
         self.put(h - 1, 0, (self.message or keys).ljust(w), curses.A_REVERSE)
-        self.scr.refresh()
+
+    def draw_help(self):
+        h, w = self.scr.getmaxyx()
+        y, x, box, self.help = help_box(help_lines(w), h, w, self.help)
+        for i, line in enumerate(box):
+            if i in (0, len(box) - 1):
+                self.put(y + i, x, line, self.c_head)
+                continue
+            self.put(y + i, x, line)
+            self.put(y + i, x, "│", self.c_head)
+            self.put(y + i, x + len(line) - 1, "│", self.c_head)
+            for m in re.finditer(r"(?:^│ |    )(keys|usage|columns)\b", line):
+                self.put(y + i, x + m.start(1), m.group(1), curses.A_BOLD)
+
+    def help_key(self, key):
+        """Scroll keys move the open help; any other key closes it."""
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.help += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            self.help -= 1
+        elif key == curses.KEY_NPAGE:
+            self.help += self.body_rows()
+        elif key == curses.KEY_PPAGE:
+            self.help -= self.body_rows()
+        elif key != curses.KEY_RESIZE:
+            self.help = None
 
     def prompt(self, label):
         h, w = self.scr.getmaxyx()
@@ -785,9 +887,11 @@ class Top:
         curses.curs_set(1)
         self.put(h - 1, 0, label.ljust(w), curses.A_REVERSE)
         self.scr.timeout(-1)
+        self.scr.attron(curses.A_REVERSE)  # what you type stays on the footer bar
         try:
             return self.scr.getstr(h - 1, len(label), 80).decode(errors="ignore").strip()
         finally:
+            self.scr.attroff(curses.A_REVERSE)
             curses.noecho()
             curses.curs_set(0)
             self.scr.timeout(200)
@@ -799,11 +903,16 @@ class Top:
         self.scr.timeout(200)  # redraw the clock and check the refresh interval 5x a second
         while True:
             self.draw()
+            if self.help is not None:
+                self.draw_help()
+            self.scr.refresh()
             key = self.scr.getch()
             if key != -1:
                 self.message = ""
             body, last_idx = self.body_rows(), max(0, len(self.view) - 1)
-            if key in (ord("q"), 27):
+            if key != -1 and self.help is not None:
+                self.help_key(key)
+            elif key in (ord("q"), 27):
                 return None
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.cursor = min(last_idx, self.cursor + 1)
@@ -837,6 +946,8 @@ class Top:
                 self.interval = max(0.5, self.interval / 2)
             elif key == ord(" "):
                 self.reload()
+            elif key == ord("?"):
+                self.help = 0
             if time.monotonic() - self.last_load >= self.interval:
                 self.reload()
 
@@ -991,7 +1102,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"claude-top {__version__}")
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default 2)")
-    ap.add_argument("-s", "--state", choices=STATES[1:], help="only sessions in this state (blocked = needs input)")
+    ap.add_argument("-s", "--state", choices=STATES[1:] + list(STATE_ALIASES),
+                    help="only sessions in this state (blocked or waiting = needs your input)")
     ap.add_argument("-g", "--grep", help="text filter: name, ask, pending question, status or folder")
     ap.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
                     help=f"context window size for the CTX %% column (default {DEFAULT_WINDOW:,} tokens)")
@@ -1001,6 +1113,7 @@ def main():
     args = ap.parse_args()
     if args.window <= 0:
         ap.error("--window must be a positive number of tokens")
+    args.state = STATE_ALIASES.get(args.state, args.state)
 
     if args.once or not sys.stdout.isatty() or curses is None:
         try:

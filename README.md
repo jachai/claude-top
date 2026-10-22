@@ -1,18 +1,24 @@
 # claude-top
 
+`top` for your Claude Code sessions: what each one is doing, what it's waiting on, and how fast you're using your plan.
+
 [![test](https://github.com/jachai/claude-top/actions/workflows/test.yml/badge.svg)](https://github.com/jachai/claude-top/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/claude-agents-top)](https://pypi.org/project/claude-agents-top/)
+[![Python](https://img.shields.io/pypi/pyversions/claude-agents-top)](https://pypi.org/project/claude-agents-top/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/jachai/claude-top/blob/main/LICENSE)
 
-`top` for your Claude Code sessions. It's a live view of every background session showing when it was last active, what it's waiting on, its model, effort and context size, and the helpers it started. It also shows how fast you're using your plan's limits.
+![claude-top demo](https://raw.githubusercontent.com/jachai/claude-top/main/docs/demo.gif)
 
-![claude-top](docs/screenshot.png)
+It's a live view of every background session showing when it was last active, what it's waiting on, its model, effort and context size, and the helpers it started. The header shows your 5-hour and weekly plan usage, how fast you're using it, and when you'd run out.
 
 ## Install
 
 ```sh
-uv tool install git+https://github.com/jachai/claude-top   # or: pipx install git+https://github.com/jachai/claude-top
+uv tool install claude-agents-top   # or: pipx install claude-agents-top
+uv tool install git+https://github.com/jachai/claude-top   # the latest from main
 ```
 
-It's a single file with no dependencies: Python 3.9+ on macOS or Linux (on Windows only `--once` works). You can also copy `claude_top.py` anywhere on your `PATH`. Uninstall with `uv tool uninstall claude-top` (or `pipx uninstall claude-top`).
+The package is `claude-agents-top` on PyPI because `claude-top` there is an unrelated project. Both install a `claude-top` command, so don't install both. This one is a single file with no dependencies: Python 3.9+ on macOS or Linux (on Windows only `--once` works). You can also copy `claude_top.py` anywhere on your `PATH`.
 
 ## Show plan usage (optional)
 
@@ -29,7 +35,7 @@ Your status line then shows a line like `5h 38% 0.6x · week 54% 1.3x ▶ out Fr
 
 ```sh
 claude-top              # full screen, refreshes every 2s
-claude-top -s blocked   # only sessions waiting for you
+claude-top -s waiting   # only sessions waiting for you (Claude Code calls it "blocked"; -s blocked works too)
 claude-top -g billing   # text filter
 claude-top --once       # print once and exit
 ```
@@ -43,6 +49,7 @@ claude-top --once       # print once and exit
 | `f` | filter by state |
 | `/` | text filter |
 | `+` `-` | refresh slower / faster |
+| `?` | help: every key and column |
 | `q` | quit |
 
 ## Reading it
@@ -55,18 +62,19 @@ claude-top --once       # print once and exit
 - **RUN / SPAWNED**: subagents running now / started in total. **BG**: background shells, monitors and crons in flight.
 - **CTX %**: context used, measured against a 1M window. Change it with `-w 200000` or `CLAUDE_TOP_CONTEXT_WINDOW`.
 
+![claude-top screenshot](https://raw.githubusercontent.com/jachai/claude-top/main/docs/screenshot.png)
+
 ## Try it without your data
 
 ```sh
-python3 scripts/demo.py                    # made-up sessions in a temp dir
-python3 -m unittest discover -s tests      # the tests build the same kind of fixtures
+python3 scripts/demo.py   # made-up sessions in a temp dir
 ```
 
-`CLAUDE_CONFIG_DIR` and `CLAUDE_TOP_RATE_LIMITS` override where it reads from; `CLAUDE_TOP_LIVE=0` skips `claude agents`.
+`CLAUDE_CONFIG_DIR` and `CLAUDE_TOP_RATE_LIMITS` override where it reads from; `CLAUDE_TOP_LIVE=0` skips `claude agents`. Running the tests and regenerating the images is covered in [CONTRIBUTING.md](CONTRIBUTING.md), and changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Notes
 
-- Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`). They aren't a public API, so a Claude Code update can break a column; please open an issue if it does.
+- Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`). They aren't a public API, so a Claude Code update can break a column; please [open an issue](https://github.com/jachai/claude-top/issues/new/choose) if it does.
 - It only reads, except for its own files in `~/.claude/claude-top/` and, with `init`, the `statusLine` entry of `~/.claude/settings.json`. Nothing leaves your machine.
 - This is an independent project, not affiliated with Anthropic.
 

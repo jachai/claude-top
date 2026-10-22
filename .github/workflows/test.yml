@@ -3,6 +3,7 @@ name: test
 on:
   push:
   pull_request:
+  workflow_call:   # the release workflow runs the same matrix first
 
 jobs:
   test:

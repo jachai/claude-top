@@ -1,0 +1,38 @@
+name: Bug report
+description: Something is wrong or a column stopped working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please don't paste real session names, prompts, paths or transcripts. Redact them first.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: "`claude --version`"
+    validations:
+      required: true
+  - type: input
+    id: claude-top-version
+    attributes:
+      label: "`claude-top --version`"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS and terminal
+      placeholder: macOS 26.1, Ghostty 1.2 / Ubuntu 26.04, GNOME Terminal
+    validations:
+      required: true
+  - type: textarea
+    id: once
+    attributes:
+      label: "`claude-top --once` output (redacted)"
+      description: Replace session names, notes and folders with placeholders.
+      render: text
