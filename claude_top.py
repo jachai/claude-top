@@ -6,6 +6,7 @@
   claude-top -s blocked       start filtered to sessions waiting for input
   claude-top -g billing       start with a text filter
   claude-top --once           print once and exit
+  claude-top init             set claude-top as your Claude Code status line (--wrap keeps an existing one)
   claude-top statusline       status-line command: records plan limits, prints a short usage line
   claude-top record           same, but prints nothing (pipe your own status line's input into it)
 
@@ -14,7 +15,10 @@ o sort, f state filter, / text filter, +/- refresh speed, space refresh now, q q
 """
 import argparse
 import json
+import math
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,6 +30,8 @@ try:
     import curses
 except ImportError:  # Windows: only --once works
     curses = None
+
+__version__ = "0.1.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -39,16 +45,18 @@ DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "
 TAIL_BYTES = 512 * 1024
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or 1_000_000)
-HEADER_ROWS = 6
-FOOTER_ROWS = 2
+SUBAGENT_IDLE_MINUTES = 15
 
 STATES = ["all", "review", "blocked", "working", "done", "stopped"]
+LIVE_STATES = ("working", "blocked", "review")  # done/stopped sessions keep a stale inFlight snapshot
 SORTS = ["last active", "created", "context", "agents", "name"]
 STATE_LABEL = {"review": "review", "blocked": "needs-in", "working": "working", "done": "done", "stopped": "stopped"}
 LIMITS = [  # rate_limits key, label, window seconds, short key
     ("five_hour", "5h", 5 * 3600, "fh"),
     ("seven_day", "week", 7 * 86400, "sd"),
 ]
+HEADER_ROWS = 4 + len(LIMITS)  # title, agents, one per limit, filter line, column header
+FOOTER_ROWS = 2
 
 _transcript_cache = {}
 _path_cache = {}
@@ -63,7 +71,7 @@ def parse_ts(value):
         return None
     try:
         ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+    except (AttributeError, ValueError):
         return None
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
@@ -91,8 +99,10 @@ def span(secs):
 
 
 def short_model(model):
+    """claude-opus-4-1-20250805 -> opus 4.1"""
     if not model:
         return "-"
+    model = re.sub(r"-\d{8}$", "", str(model))
     return model.replace("claude-", "").replace("-", " ", 1).replace("-", ".")
 
 
@@ -105,10 +115,21 @@ def fmt_tokens(n):
 
 
 def load_json(path):
+    """The file's JSON object, or None if it is missing, unreadable or not an object."""
     try:
-        return json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def json_lines(text):
+    """Each parseable line of a .jsonl, skipping blank and corrupt ones."""
+    for line in text.splitlines():
+        try:
+            yield json.loads(line)
+        except ValueError:
+            pass
 
 
 def copy_to_clipboard(text):
@@ -138,28 +159,29 @@ def record(status_input):
         os.replace(tmp, RATE_LIMITS)
     except OSError:
         return None  # never break the user's status line
-    Usage(3).append_history(snap)
+    Usage().append_history(snap)
     return snap
 
 
 class Usage:
     """Plan limits plus a sample history, so we can tell the recent burn rate."""
 
-    def __init__(self, rate_hours):
+    def __init__(self, rate_hours=3.0):
         self.rate_hours = rate_hours
         self.samples = []  # (epoch seconds, {"fh": pct, "sd": pct})
         self.snap = None
-        h = load_json(DESKTOP_HISTORY) or {}  # Claude desktop app keeps one on macOS
-        for s in h.get("samples") or []:
-            if isinstance(s, dict) and isinstance(s.get("u"), dict) and s.get("t"):
-                self.samples.append((s["t"] / 1000.0, s["u"]))
+        desktop = load_json(DESKTOP_HISTORY) or {}  # the Claude desktop app keeps one on macOS, in ms
+        self.add_samples(desktop.get("samples") or [], scale=1 / 1000.0)
         try:
-            for line in HISTORY.read_text().splitlines():
-                s = json.loads(line)
-                self.samples.append((s["t"], s["u"]))
-        except (OSError, ValueError, KeyError):
+            self.add_samples(json_lines(HISTORY.read_text()))
+        except OSError:
             pass
         self.samples.sort(key=lambda s: s[0])
+
+    def add_samples(self, samples, scale=1.0):
+        for s in samples:
+            if isinstance(s, dict) and isinstance(s.get("u"), dict) and isinstance(s.get("t"), (int, float)):
+                self.samples.append((s["t"] * scale, s["u"]))
 
     @staticmethod
     def percents(snap):
@@ -183,15 +205,9 @@ class Usage:
     @staticmethod
     def trim_history(now):
         keep_after = now - HISTORY_KEEP_DAYS * 86400
-        kept = []
-        for line in HISTORY.read_text().splitlines():
-            try:
-                if json.loads(line)["t"] >= keep_after:
-                    kept.append(line)
-            except (ValueError, KeyError, TypeError):
-                pass
-        tmp = HISTORY.with_name(HISTORY.name + ".tmp")
-        tmp.write_text("\n".join(kept) + "\n")
+        kept = [s for s in json_lines(HISTORY.read_text()) if isinstance(s, dict) and (s.get("t") or 0) >= keep_after]
+        tmp = HISTORY.with_name(f"{HISTORY.name}.{os.getpid()}")
+        tmp.write_text("".join(json.dumps(s) + "\n" for s in kept))
         os.replace(tmp, HISTORY)
 
     def refresh(self):
@@ -203,15 +219,15 @@ class Usage:
         out = []
         limits = (self.snap or {}).get("rate_limits") or {}
         for key, label, window, hk in LIMITS:
-            lim = limits.get(key) or {}
-            used, resets = lim.get("used_percentage"), lim.get("resets_at")
-            if used is None or not resets:
+            lim = limits.get(key) if isinstance(limits.get(key), dict) else {}
+            try:
+                used, resets = float(lim["used_percentage"]), float(lim["resets_at"])
+            except (KeyError, TypeError, ValueError):
                 out.append({"label": label, "used": None})
                 continue
-            used, resets = float(used), float(resets)
-            while resets <= now:  # snapshot older than its reset
-                resets += window
-            start = resets - window
+            if resets <= now:  # snapshot older than its reset: the window has rolled over since
+                resets += (math.floor((now - resets) / window) + 1) * window
+            start = min(resets - window, now)
             elapsed = min(max((now - start) / window, 0.001), 1.0)
             avg_rate = used / ((now - start) / 3600) if now > start else 0.0
             recent_rate = self.recent_rate(hk, used, now, start, window)
@@ -221,7 +237,7 @@ class Usage:
                 "label": label, "used": used, "resets": resets, "elapsed": elapsed,
                 "pace": (used / 100.0) / elapsed,
                 "recent_pace": recent_rate / one_x if recent_rate is not None else None,
-                "stale": now - float(self.snap.get("ts") or 0),
+                "stale": now - float(self.snap.get("ts") or now),
             }
             if rate > 0 and used < 100:
                 out_at = now + (100.0 - used) / rate * 3600
@@ -269,7 +285,7 @@ def pace_level(pace):
 def usage_segments(w, now):
     """One header line per limit, as [(text, color level)]."""
     if w["used"] is None:
-        return [(f" {w['label']:<5}", "bold"), ("no data yet: set `claude-top statusline` as your status line", "dim")]
+        return [(f" {w['label']:<5}", "bold"), ("no data yet: run `claude-top init` to record your plan limits", "dim")]
     level = pace_level(w["pace"])
     reset_local = datetime.fromtimestamp(w["resets"]).strftime("%a %H:%M")
     segs = [
@@ -311,9 +327,13 @@ def find_transcript(state):
     path = state.get("linkScanPath")
     if path and os.path.exists(path):
         return path
-    if sid not in _path_cache:
-        hits = list(PROJECTS.glob(f"*/{sid}.jsonl")) if sid else []
-        _path_cache[sid] = str(hits[0]) if hits else None
+    if not sid:
+        return None
+    if sid not in _path_cache:  # misses aren't cached: a new session's transcript appears a moment later
+        hits = list(PROJECTS.glob(f"*/{sid}.jsonl"))
+        if not hits:
+            return None
+        _path_cache[sid] = str(hits[0])
     return _path_cache[sid]
 
 
@@ -331,8 +351,8 @@ def activity_of(msg):
             tool_input = block.get("input") or {}
             return str(tool_input.get("description") or tool_input.get("prompt") or block.get("name") or "")[:200]
     for block in content:
-        if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
-            return block["text"].strip().splitlines()[0][:200]
+        if isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip():
+            return str(block["text"]).strip().splitlines()[0][:200]
     return ""
 
 
@@ -347,6 +367,8 @@ def scan_lines(lines, info):
             e = json.loads(raw)
         except ValueError:
             continue
+        if not isinstance(e, dict):
+            continue
         kind = e.get("type")
         if kind == "api-request" and not info["effort"]:
             if e.get("querySource") not in (None, "repl_main_thread"):
@@ -355,7 +377,7 @@ def scan_lines(lines, info):
             info["model"] = info["model"] or params.get("model")
             info["effort"] = (params.get("output_config") or {}).get("effort")
         elif kind == "assistant" and not e.get("isSidechain"):
-            msg = e.get("message") or {}
+            msg = e.get("message") if isinstance(e.get("message"), dict) else {}
             if info["activity"] is None:
                 info["activity"] = activity_of(msg) or None
             if info["ctx"] is not None:
@@ -383,15 +405,16 @@ def transcript_info(path):
     if cached and cached[0] == (st.st_size, st.st_mtime):
         return cached[1]
     info["mtime"] = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-    size = TAIL_BYTES
+    size, scanned = TAIL_BYTES, 0
     try:
         with open(path, "rb") as fh:
             while True:  # read only the tail; widen it if the answer isn't there yet
                 fh.seek(max(0, st.st_size - size))
                 lines = fh.read().split(b"\n")
                 if st.st_size > size:
-                    lines = lines[1:]
-                scan_lines(lines, info)
+                    lines = lines[1:]  # the first line is cut mid-way
+                scan_lines(lines[: len(lines) - scanned], info)  # the newest lines were scanned last round
+                scanned = len(lines)
                 if complete(info) or size >= min(st.st_size, MAX_TAIL_BYTES):
                     break
                 size *= 4
@@ -402,11 +425,15 @@ def transcript_info(path):
 
 
 def agents_info(transcript, live):
-    """Subagents a session started: total, running now, and the model mix."""
+    """Subagents a session started: total, running now, and the model mix.
+
+    Only a live session can have running subagents, and a subagent counts as running only while it is
+    not finished AND its transcript is still being written: a meta can miss its finished flag (crash, kill).
+    """
     info = {"total": 0, "running": 0, "models": {}, "active": []}
     if not transcript:
         return info
-    d = Path(transcript[: -len(".jsonl")]) / "subagents"
+    d = Path(transcript).with_suffix("") / "subagents"
     try:
         mtime = d.stat().st_mtime
     except OSError:
@@ -419,15 +446,15 @@ def agents_info(transcript, live):
         info["total"] += 1
         model = clean(meta.get("model") or "inherit")
         info["models"][model] = info["models"].get(model, 0) + 1
-        if live and not meta.get("finished") and recently_written(meta_file.with_name(meta_file.name[: -len(".meta.json")] + ".jsonl")):
+        if live and not meta.get("finished") and recently_written(meta_file.with_suffix("").with_suffix(".jsonl")):
             info["running"] += 1
             info["active"].append(clean(meta.get("description") or meta.get("agentType") or meta_file.stem))
-    _agents_cache[str(d)] = (mtime, info)
+    if not live:  # a live session's count depends on the clock, and its dir mtime won't change when it ends
+        _agents_cache[str(d)] = (mtime, info)
     return info
 
 
-def recently_written(path, minutes=15):
-    """A subagent's meta can miss its finished flag (crash, kill); trust a transcript that is still growing."""
+def recently_written(path, minutes=SUBAGENT_IDLE_MINUTES):
     try:
         return time.time() - path.stat().st_mtime < minutes * 60
     except OSError:
@@ -445,67 +472,94 @@ def live_sessions():
         return {}
 
 
-def load_rows():
+def merge_live(state, live_entry):
+    """state.json overlaid with the agents view, whose state and name are current; state.json catches up later.
+
+    A session the view reports done but still holds open (a pid), with a worktree to look at, is what the
+    built-in view calls "Ready for review".
+    """
+    if not live_entry:
+        return state
+    live_state = live_entry.get("state") or state.get("state")
+    worktree = state.get("worktreePath")
+    if live_state == "done" and live_entry.get("pid") and worktree and os.path.isdir(worktree):
+        live_state = "review"
+    merged = {**state, "state": live_state, "name": live_entry.get("name") or state.get("name"),
+              "sessionId": state.get("sessionId") or live_entry.get("sessionId"),
+              "cwd": state.get("cwd") or live_entry.get("cwd")}
+    if not merged.get("createdAt") and isinstance(live_entry.get("startedAt"), int):
+        merged["createdAt"] = datetime.fromtimestamp(live_entry["startedAt"] / 1000, tz=timezone.utc).isoformat()
+    return merged
+
+
+def in_flight(state, agents):
+    """What a live session has in flight: (agents with the local_agent hint applied, background task count, kinds).
+
+    artifact_watch tasks are passive watchers, not work; local_agent is a subagent, which the session reports
+    before the helper's meta file exists.
+    """
+    flight = state.get("inFlight") if isinstance(state.get("inFlight"), dict) else {}
+    kinds = [str(k) for k in flight.get("kinds") or []]
+    if "local_agent" in kinds and not agents["running"]:
+        agents = {**agents, "running": 1}
+    watchers = (flight.get("drainableMonitors") or 0) if "artifact_watch" in kinds else 0
+    bg_kinds = [k for k in kinds if k not in ("artifact_watch", "local_agent")]
+    background = max(0, (flight.get("tasks") or 0) - watchers - agents["running"]) if bg_kinds else 0
+    return agents, background, bg_kinds
+
+
+def load_rows(live_list=None):
     rows = []
-    live_list = live_sessions()
-    states = {p.parent.name: p for p in JOBS.glob("*/state.json")}
-    for job_id in set(states) | {i for i, x in live_list.items() if x.get("kind") != "background"}:
-        state_file = states.get(job_id)
+    if live_list is None:
+        live_list = live_sessions()
+    state_files = {p.parent.name: p for p in JOBS.glob("*/state.json")}
+    for job_id in set(state_files) | {i for i, x in live_list.items() if x.get("kind") != "background"}:
+        state_file = state_files.get(job_id)
         live_entry = live_list.get(job_id) or {}
-        d = (load_json(state_file) if state_file else None) or {}
-        if not d and not live_entry:
+        state = (load_json(state_file) if state_file else None) or {}
+        if not state and not live_entry:
             continue
-        if live_entry:  # the agents view's state and name are current; state.json catches up later
-            state = live_entry.get("state") or d.get("state")
-            worktree = d.get("worktreePath")
-            if state == "done" and live_entry.get("pid") and worktree and os.path.isdir(worktree):
-                state = "review"  # finished, still open, with a worktree to look at: "Ready for review"
-            d = {**d, "state": state, "name": live_entry.get("name") or d.get("name"),
-                 "sessionId": d.get("sessionId") or live_entry.get("sessionId"), "cwd": d.get("cwd") or live_entry.get("cwd")}
-            if not d.get("createdAt") and str(live_entry.get("startedAt") or "").isdigit():
-                d["createdAt"] = datetime.fromtimestamp(int(live_entry["startedAt"]) / 1000, tz=timezone.utc).isoformat()
-        path = find_transcript(d)
+        state = merge_live(state, live_entry)
+        path = find_transcript(state)
         t = transcript_info(path)
-        live = d.get("state") in ("working", "blocked", "review")  # done/stopped keep a stale inFlight snapshot
-        a = agents_info(path, live)
-        flight = (d.get("inFlight") or {}) if live else {}
-        kinds = flight.get("kinds") or []
-        if "local_agent" in kinds and not a["running"]:
-            a = {**a, "running": 1}  # the session reports a helper before its meta file does
-        watchers = (flight.get("drainableMonitors") or 0) if "artifact_watch" in kinds else 0
-        background = max(0, (flight.get("tasks") or 0) - watchers - a["running"])
-        bg_kinds = [k for k in kinds if k not in ("artifact_watch", "local_agent")]
-        updated = parse_ts(d.get("updatedAt"))
+        live = state.get("state") in LIVE_STATES
+        agents = agents_info(path, live)
+        if live:
+            agents, background, bg_kinds = in_flight(state, agents)
+        else:
+            background, bg_kinds = 0, []
+        updated = parse_ts(state.get("updatedAt"))
         if not updated and state_file:
             try:
                 updated = datetime.fromtimestamp(state_file.stat().st_mtime, tz=timezone.utc)
             except OSError:  # session removed while we were reading
                 continue
-        if not (updated or t["mtime"]):
+        created = parse_ts(state.get("createdAt"))
+        last = max(filter(None, (updated, t["mtime"])), default=created)  # a brand-new session has only its start
+        if not last:
             continue
-        last = max(x for x in (updated, t["mtime"]) if x)
-        result = (d.get("output") or {}).get("result") if isinstance(d.get("output"), dict) else None
-        note = d.get("needs") or (result if d.get("state") in ("done", "review") else None) or d.get("detail") or ""
+        result = state["output"].get("result") if isinstance(state.get("output"), dict) else None
+        note = state.get("needs") or (result if state.get("state") in ("done", "review") else None) or state.get("detail") or ""
         stale_note = updated is None or (t["mtime"] and (t["mtime"] - updated).total_seconds() > 5)
-        if d.get("state") == "working" and t["activity"] and stale_note:
+        if state.get("state") == "working" and t["activity"] and stale_note:
             note = t["activity"]  # state.json still holds the note from before this turn
         rows.append({
-            "id": job_id,
+            "id": clean(job_id),
             "kind": live_entry.get("kind") or "background",
-            "state": d.get("state") or "?",
-            "name": clean(d.get("name") or d.get("intent") or job_id),
+            "state": state.get("state") or "?",
+            "name": clean(state.get("name") or state.get("intent") or job_id),
             "note": clean(note),
-            "search": " ".join(str(d.get(k) or "") for k in ("name", "intent", "needs", "detail", "cwd")).lower(),
-            "cwd": clean(d.get("cwd") or ""),
-            "session": d.get("resumeSessionId") or d.get("sessionId"),
+            "search": " ".join(str(state.get(k) or "") for k in ("name", "intent", "needs", "detail", "cwd")).lower(),
+            "cwd": clean(state.get("cwd") or ""),
+            "session": clean(state.get("resumeSessionId") or state.get("sessionId") or ""),
             "last": last,
-            "created": parse_ts(d.get("createdAt")) or last,
+            "created": created or last,
             "model": t["model"],
             "effort": t["effort"],
             "ctx": t["ctx"],
-            "agents": a,
-            "bg": background if bg_kinds else 0,
-            "bg_kinds": bg_kinds,
+            "agents": agents,
+            "bg": background,
+            "bg_kinds": [clean(k) for k in bg_kinds],
         })
     return rows
 
@@ -513,7 +567,8 @@ def load_rows():
 def select(rows, state, text, sort):
     out = [r for r in rows if state in (None, "all") or r["state"] == state]
     if text:
-        out = [r for r in out if text.lower() in r["search"] or text.lower() in r["id"]]
+        text = text.lower()
+        out = [r for r in out if text in r["search"] or text in r["id"].lower()]
     key = {
         "last active": lambda r: r["last"],
         "created": lambda r: r["created"],
@@ -528,10 +583,12 @@ COLUMNS = [
     ("LAST ACTIVE", 12), ("AGO", 4), ("AGE", 4), ("STATE", 8), ("ID", 8), ("MODEL", 10), ("EFFORT", 6),
     ("RUN", 3), ("SPAWNED", 7), ("BG", 3), ("CTX", 6), ("CTX %", 10), ("NAME", 34),
 ]
-COL_X = {h: sum(w + 2 for _, w in COLUMNS[:i]) for i, (h, _) in enumerate(COLUMNS)}
+COL = {h: i for i, (h, _) in enumerate(COLUMNS)}  # column -> index into row_cells
+COL_X = {h: sum(w + 2 for _, w in COLUMNS[:i]) for i, (h, _) in enumerate(COLUMNS)}  # column -> screen x
 
 
 def row_cells(r, now, window):
+    """One cell per column; CTX % is a fraction (or None) that plain_line draws as a bar."""
     a = r["agents"]
     return [
         r["last"].astimezone().strftime("%b %d %H:%M"),
@@ -559,8 +616,8 @@ def bar(pct, width):
 
 def plain_line(cells):
     parts = []
-    for (_, w), cell in zip(COLUMNS, cells):
-        if isinstance(cell, float) or cell is None:
+    for i, ((_, w), cell) in enumerate(zip(COLUMNS, cells)):
+        if i == COL["CTX %"] and not isinstance(cell, str):  # the header row is all text
             cell = bar(cell, w - 4) + (f"{round(cell * 100):>3}%" if cell is not None else "    ")
         parts.append(f"{str(cell)[:w]:<{w}}")
     return "  ".join(parts)
@@ -605,18 +662,16 @@ def selected_detail(r):
 
 
 def print_once(args):
-    now = datetime.now(timezone.utc)
+    now, now_s = datetime.now(timezone.utc), time.time()
     width = shutil.get_terminal_size((200, 20)).columns
     usage = Usage(args.rate_hours)
     usage.refresh()
     rows = load_rows()
     print("\n".join(summary(rows)))
-    for w in usage.windows(time.time()):
-        print("".join(t for t, _ in usage_segments(w, time.time()))[:width])
+    for w in usage.windows(now_s):
+        print("".join(text for text, _ in usage_segments(w, now_s))[:width])
     print(plain_line([h for h, _ in COLUMNS]) + "  NOTE")
-    for i, r in enumerate(select(rows, args.state, args.grep, "last active")):
-        if args.n and i >= args.n:
-            break
+    for r in select(rows, args.state, args.grep, "last active")[: args.n or None]:
         print((plain_line(row_cells(r, now, args.window)) + "  " + r["note"])[:width])
 
 
@@ -638,11 +693,13 @@ class Top:
         self.last_load = 0.0
 
     def colors(self):
-        curses.start_color()
-        curses.use_default_colors()
-        for i, c in enumerate([curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_CYAN], 1):
-            curses.init_pair(i, c, -1)
-        yellow, green, red, cyan = (curses.color_pair(i) for i in range(1, 5))
+        yellow = green = red = cyan = 0
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i, c in enumerate([curses.COLOR_YELLOW, curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_CYAN], 1):
+                curses.init_pair(i, c, -1)
+            yellow, green, red, cyan = (curses.color_pair(i) for i in range(1, 5))
         self.c_state = {"review": cyan | curses.A_BOLD, "blocked": yellow | curses.A_BOLD, "working": green | curses.A_BOLD,
                         "stopped": red, "done": curses.A_DIM}
         self.c_level = {"ok": green, "warn": yellow | curses.A_BOLD, "hot": red | curses.A_BOLD,
@@ -684,9 +741,10 @@ class Top:
         head = f" claude-top {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
         self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
         self.put(1, 0, f" {agents}".ljust(w), curses.A_REVERSE)
-        for i, win in enumerate(self.usage.windows(time.time())):
+        now_s = time.time()
+        for i, win in enumerate(self.usage.windows(now_s)):
             x = 0
-            for text, level in usage_segments(win, time.time()):
+            for text, level in usage_segments(win, now_s):
                 x = self.put(2 + i, x, text, self.c_level.get(level, 0))
         flt = f" sort: {self.sort}   state: {self.state}   filter: {self.text or '-'}   showing {len(self.view)}/{len(self.rows)}"
         self.put(HEADER_ROWS - 2, 0, flt, curses.A_DIM)
@@ -705,12 +763,12 @@ class Top:
                      curses.A_REVERSE if sel else 0)
             if sel:
                 continue
-            self.put(y, COL_X["STATE"], cells[3][:8], self.c_state.get(r["state"], 0))
+            self.put(y, COL_X["STATE"], cells[COL["STATE"]][:8], self.c_state.get(r["state"], 0))
             if r["agents"]["running"]:
-                self.put(y, COL_X["RUN"], cells[7], self.c_state["working"])
+                self.put(y, COL_X["RUN"], cells[COL["RUN"]], self.c_state["working"])
             if r["bg"]:
-                self.put(y, COL_X["BG"], cells[9], self.c_state["blocked"])
-            pct = cells[11]
+                self.put(y, COL_X["BG"], cells[COL["BG"]], self.c_state["blocked"])
+            pct = cells[COL["CTX %"]]
             if pct is not None:
                 level = "ok" if pct < 0.5 else "warn" if pct < 0.8 else "hot"
                 self.put(y, COL_X["CTX %"], bar(pct, 6), self.c_level[level])
@@ -732,14 +790,15 @@ class Top:
         finally:
             curses.noecho()
             curses.curs_set(0)
+            self.scr.timeout(200)
 
     def run(self):
         curses.curs_set(0)
         self.colors()
         self.reload()
+        self.scr.timeout(200)  # redraw the clock and check the refresh interval 5x a second
         while True:
             self.draw()
-            self.scr.timeout(200)
             key = self.scr.getch()
             if key != -1:
                 self.message = ""
@@ -782,7 +841,139 @@ class Top:
                 self.reload()
 
 
+# ---------------------------------------------------------------- init
+
+
+SETTINGS = CLAUDE_DIR / "settings.json"
+WRAPPER = DATA_DIR / "statusline.sh"
+INIT_STATE = DATA_DIR / "init.json"  # the statusLine we installed and the one it replaced, for --undo
+
+
+def own_command():
+    """How the status line should call us: an absolute path, since it runs outside your login shell."""
+    exe = sys.argv[0] if os.path.basename(sys.argv[0]) == "claude-top" else shutil.which("claude-top")
+    if exe and os.path.isfile(exe):
+        return shlex.quote(os.path.abspath(exe))
+    return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+
+def is_ours(status_line):
+    command = str((status_line or {}).get("command") or "")
+    return command == str(WRAPPER) or bool(re.search(r"claude[-_]top(\.py)?'? statusline$", command))
+
+
+def write_json(path, data):
+    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def write_settings(settings, dry_run):
+    """Replace settings.json atomically, keeping a timestamped copy of the old one next to it."""
+    backup = SETTINGS.with_name(f"{SETTINGS.name}.{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+    if dry_run:
+        print(f"dry run: would back up {SETTINGS} to {backup.name} and write:")
+        print(json.dumps({"statusLine": settings.get("statusLine")}, indent=2))
+        return
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, backup)
+        print(f"backed up {SETTINGS} to {backup.name}")
+    write_json(SETTINGS, settings)
+    print(f"wrote {SETTINGS}")
+
+
+def wrapper_script(original_command):
+    return (
+        "#!/bin/sh\n"
+        "# Written by `claude-top init --wrap`: records your plan limits for claude-top, then runs the status line\n"
+        "# you had before with the same input. `claude-top init --undo` puts the original back.\n"
+        'input=$(cat)\n'
+        f"printf '%s' \"$input\" | {own_command()} record\n"
+        f"printf '%s' \"$input\" | {original_command}\n"
+    )
+
+
+def checklist():
+    encoding = (sys.stdout.encoding or "").lower()
+    print("\ncheck:")
+    print(f"  python {sys.version_info.major}.{sys.version_info.minor}: " + ("ok" if sys.version_info >= (3, 9) else "needs 3.9+"))
+    print("  claude on PATH: " + ("ok" if shutil.which("claude") else "not found: live states (working/review) need `claude agents`"))
+    print("  UTF-8 terminal: " + ("ok" if "utf" in encoding else f"stdout is {encoding or 'unknown'}: the bars need a UTF-8 locale"))
+    print("  the usage bars fill in after Claude Code next refreshes its status line (send it a message)")
+    print("\nnext: claude-top")
+
+
+def init_main(argv):
+    ap = argparse.ArgumentParser(prog="claude-top init", description="Set claude-top as your Claude Code status line.")
+    ap.add_argument("--wrap", action="store_true", help="keep an existing status line: run it after recording the limits")
+    ap.add_argument("--dry-run", action="store_true", help="show the change without writing anything")
+    ap.add_argument("--undo", action="store_true", help="put back the status line you had before init")
+    args = ap.parse_args(argv)
+
+    if SETTINGS.exists():
+        try:
+            settings = json.loads(SETTINGS.read_text())
+        except ValueError as e:
+            sys.exit(f"{SETTINGS} is not valid JSON ({e}); fix it first, nothing was changed")
+        if not isinstance(settings, dict):
+            sys.exit(f"{SETTINGS} is not a JSON object; nothing was changed")
+    else:
+        settings = {}
+    current = settings.get("statusLine")
+    if current is not None and not isinstance(current, dict):
+        sys.exit(f"settings.json has an unexpected statusLine ({json.dumps(current)}); nothing was changed")
+    previous = (load_json(INIT_STATE) or {}).get("previous") if is_ours(current) else current
+
+    if args.undo:
+        if not is_ours(current):
+            sys.exit("the status line in settings.json isn't claude-top's; nothing to undo")
+        if previous:
+            settings["statusLine"] = previous
+        else:
+            settings.pop("statusLine", None)
+        write_settings(settings, args.dry_run)
+        if not args.dry_run:
+            for p in (INIT_STATE, WRAPPER):
+                if p.exists():
+                    p.unlink()
+            print(f"restored {json.dumps(previous)}" if previous else "removed claude-top's status line")
+        return
+
+    status_line = {"type": "command", "command": f"{own_command()} statusline"}
+    if current and not is_ours(current):
+        if not args.wrap or current.get("type") != "command" or not current.get("command"):
+            print(f"settings.json already has a status line: {json.dumps(current)}")
+            print("claude-top won't replace it. Either:")
+            print("  claude-top init --wrap     record the limits, then run your status line unchanged, or")
+            print('  add `echo "$input" | claude-top record` to your own status-line script.')
+            sys.exit(1)
+        status_line = {**current, "command": str(WRAPPER)}
+        script = wrapper_script(current["command"])
+        if args.dry_run:
+            print(f"dry run: would write {WRAPPER}:\n{script}")
+        else:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            WRAPPER.write_text(script)
+            WRAPPER.chmod(0o755)
+            print(f"wrote {WRAPPER}")
+    elif current == status_line or (is_ours(current) and current.get("command") == str(WRAPPER) and WRAPPER.exists()):
+        print(f"already set up: {json.dumps(current)}")
+        checklist()
+        return
+
+    settings["statusLine"] = status_line
+    write_settings(settings, args.dry_run)
+    if not args.dry_run:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        write_json(INIT_STATE, {"previous": previous, "statusLine": status_line})
+    print(f"status line: {status_line['command']}")
+    checklist()
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        return init_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("record", "statusline"):
         if sys.stdin.isatty():
             sys.exit(f"claude-top {sys.argv[1]} reads Claude Code's status-line JSON on stdin; see the README")
@@ -792,12 +983,13 @@ def main():
             status_input = None
         record(status_input)
         if sys.argv[1] == "statusline":
-            usage = Usage(3)
+            usage = Usage()
             usage.refresh()
             print(statusline_text(usage, time.time()))
         return
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"claude-top {__version__}")
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default 2)")
     ap.add_argument("-s", "--state", choices=STATES[1:], help="only sessions in this state (blocked = needs input)")
     ap.add_argument("-g", "--grep", help="text filter: name, ask, pending question, status or folder")
@@ -817,9 +1009,15 @@ def main():
         except BrokenPipeError:  # e.g. piped into head
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return
-    target = curses.wrapper(lambda scr: Top(scr, args).run())
+    try:
+        target = curses.wrapper(lambda scr: Top(scr, args).run())
+    except KeyboardInterrupt:
+        return
     if target:
-        os.execvp("claude", ["claude", "attach", target])
+        try:
+            os.execvp("claude", ["claude", "attach", target])
+        except OSError:
+            sys.exit(f"could not run `claude attach {target}`: is claude on your PATH?")
 
 
 if __name__ == "__main__":

@@ -100,7 +100,7 @@ def screenshot(env, out, cols=170, rows=21):
     import termios
 
     import pyte
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     pid, fd = pty.fork()
     if pid == 0:
