@@ -29,7 +29,7 @@ claude-top init          # sets the status line in ~/.claude/settings.json (back
 claude-top init --wrap   # already have a status line? keep it: record the limits, then run yours
 ```
 
-Your status line then shows a line like `5h 38% 0.6x · week 54% 1.3x ▶ out Fri 13:37` (with `--wrap`, your own line, unchanged). `--dry-run` shows the change, `--undo` puts things back. If you'd rather edit your own script, add `echo "$input" | claude-top record` to it.
+Your status line then shows a line like `5h 38% 0.6x · week 54% 1.3x → out Fri 13:37` (with `--wrap`, your own line, unchanged). `--dry-run` shows the change, `--undo` puts things back. If you'd rather edit your own script, add `echo "$input" | claude-top record` to it.
 
 ## Use
 
@@ -57,7 +57,7 @@ claude-top --once       # print once and exit
 - **Header**: sessions by state (`work`ing, `wait`ing for you, `review` = finished in a worktree that's still open, `done`, `stop`ped), then what's running now: working sessions + subagents, subagents spawned in total, and background tasks.
 - **Usage bars (5h, week)**: the bar fills with the % of the limit used, and `│` marks how much of the window (`time`) has passed. A bar filled past the `│` means you're ahead of budget.
 - **Speed (`1.3x`)**: % used ÷ % of time elapsed. `1.0x` lands exactly on 100% at reset, and `2.0x` runs out halfway through. The gauge's middle line is 1x. **now** is the speed over the last few hours (`--rate-hours`, default 3; the week uses a little more because limits come in whole percents).
-- **▶**: when you'll run out at the current speed (and how early that is), or roughly where you'll end up at reset.
+- **→**: when you'll run out at the current speed (and how early that is), or roughly where you'll end up at reset.
 - **LAST ACTIVE / AGE**: last activity vs. when the session was created. The built-in agents view only shows age.
 - **RUN / SPAWNED**: subagents running now / started in total. **BG**: background shells, monitors and crons in flight.
 - **CTX %**: context used, measured against a 1M window. Change it with `-w 200000` or `CLAUDE_TOP_CONTEXT_WINDOW`.

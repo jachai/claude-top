@@ -31,7 +31,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -312,9 +312,9 @@ def usage_segments(w, now):
         segs.append((f" now {w['recent_pace']:.1f}x", pace_level(w["recent_pace"])))
     if w["runs_out"]:
         out = datetime.fromtimestamp(w["runs_out"]).strftime("%a %H:%M")
-        segs.append((f" · ▶ out {out} ({span(w['resets'] - w['runs_out'])} early)", "hot"))
+        segs.append((f" · → out {out} ({span(w['resets'] - w['runs_out'])} early)", "hot"))
     else:
-        segs.append((f" · ▶ ~{w['at_reset']:.0f}% at reset", "ok"))
+        segs.append((f" · → ~{w['at_reset']:.0f}% at reset", "ok"))
     if w["stale"] > 3600:
         segs.append((f" (as of {span(w['stale'])} ago)", "dim"))
     return segs
@@ -327,7 +327,7 @@ def statusline_text(usage, now):
             continue
         text = f"{w['label']} {w['used']:.0f}% {w['pace']:.1f}x"
         if w["runs_out"]:
-            text += " ▶ out " + datetime.fromtimestamp(w["runs_out"]).strftime("%a %H:%M")
+            text += " → out " + datetime.fromtimestamp(w["runs_out"]).strftime("%a %H:%M")
         parts.append(text)
     return " · ".join(parts)
 
@@ -351,7 +351,8 @@ def find_transcript(state):
 
 
 def complete(info):
-    return info["model"] and info["effort"] and info["ctx"] is not None and info["activity"] is not None
+    return (info["model"] and info["effort"] and info["ctx"] is not None and info["activity"] is not None
+            and info["last_ts"] is not None)
 
 
 def activity_of(msg):
@@ -370,11 +371,11 @@ def activity_of(msg):
 
 
 def scan_lines(lines, info):
-    """Walk transcript lines newest-first until model, effort and context are known."""
+    """Walk transcript lines newest-first until model, effort, context, activity and last message are known."""
     for raw in reversed(lines):
         if complete(info):
             return
-        if b'"api-request"' not in raw and b'"assistant"' not in raw:
+        if b'"api-request"' not in raw and b'"assistant"' not in raw and b'"user"' not in raw:
             continue
         try:
             e = json.loads(raw)
@@ -383,6 +384,10 @@ def scan_lines(lines, info):
         if not isinstance(e, dict):
             continue
         kind = e.get("type")
+        if kind in ("user", "assistant") and info["last_ts"] is None and not e.get("isSidechain"):
+            # the file's mtime is no good: bookkeeping lines (e.g. artifact-autoreact-ledger) keep
+            # touching finished sessions' transcripts, so the newest real message is the activity time
+            info["last_ts"] = parse_ts(e.get("timestamp"))
         if kind == "api-request" and not info["effort"]:
             if e.get("querySource") not in (None, "repl_main_thread"):
                 continue
@@ -407,7 +412,7 @@ def scan_lines(lines, info):
 
 
 def transcript_info(path):
-    info = {"model": None, "effort": None, "ctx": None, "activity": None, "mtime": None}
+    info = {"model": None, "effort": None, "ctx": None, "activity": None, "last_ts": None, "mtime": None}
     if not path:
         return info
     try:
@@ -548,12 +553,13 @@ def load_rows(live_list=None):
             except OSError:  # session removed while we were reading
                 continue
         created = parse_ts(state.get("createdAt"))
-        last = max(filter(None, (updated, t["mtime"])), default=created)  # a brand-new session has only its start
+        last = max(filter(None, (updated, t["last_ts"] or t["mtime"])), default=created)  # a brand-new session has only its start
         if not last:
             continue
         result = state["output"].get("result") if isinstance(state.get("output"), dict) else None
         note = state.get("needs") or (result if state.get("state") in ("done", "review") else None) or state.get("detail") or ""
-        stale_note = updated is None or (t["mtime"] and (t["mtime"] - updated).total_seconds() > 5)
+        newest = t["last_ts"] or t["mtime"]
+        stale_note = updated is None or (newest and (newest - updated).total_seconds() > 5)
         if state.get("state") == "working" and t["activity"] and stale_note:
             note = t["activity"]  # state.json still holds the note from before this turn
         rows.append({
@@ -703,7 +709,7 @@ HELP_KEYS = [
 ]
 HELP_USAGE = [
     ("5h  week", "plan used; │ marks time elapsed"), ("1.0x", "speed: lands on 100% at reset"),
-    ("now", "speed over the last few hours"), ("▶", "when you run out, or % at reset"),
+    ("now", "speed over the last few hours"), ("→", "when you run out, or % at reset"),
 ]
 HELP_COLUMNS = [
     ("LAST ACTIVE", "when the session last did something"), ("AGO", "time since then"),

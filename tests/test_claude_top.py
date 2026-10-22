@@ -36,11 +36,13 @@ def api_request(model=MODEL, effort="high", source="repl_main_thread"):
     return {"type": "api-request", "querySource": source, "params": {"model": model, "output_config": {"effort": effort}}}
 
 
-def assistant(ctx, content=(), model=MODEL, sidechain=False, effort=None):
+def assistant(ctx, content=(), model=MODEL, sidechain=False, effort=None, at=None):
     usage = {"input_tokens": 10, "cache_read_input_tokens": ctx - 40, "cache_creation_input_tokens": 20, "output_tokens": 10}
     event = {"type": "assistant", "isSidechain": sidechain, "message": {"model": model, "usage": usage, "content": list(content)}}
     if effort:
         event["perTurnEffort"] = effort
+    if at is not None:
+        event["timestamp"] = iso(at)
     return event
 
 
@@ -185,7 +187,7 @@ class UsageMathTest(Sandbox):
         usage = self.ct.Usage()
         usage.refresh()
         text = self.ct.statusline_text(usage, self.now)
-        self.assertRegex(text, r"^5h 50% 2\.0x ▶ out \w{3} \d\d:\d\d · week 20% 0\.4x$")
+        self.assertRegex(text, r"^5h 50% 2\.0x → out \w{3} \d\d:\d\d · week 20% 0\.4x$")
         self.assertNotIn("\n", "".join(t for w in usage.windows(self.now) for t, _ in self.ct.usage_segments(w, self.now)))
 
 
@@ -274,6 +276,20 @@ class TranscriptTest(Sandbox):
 
 
 class RowsTest(Sandbox):
+    def test_last_active_is_the_last_message_not_the_file_time(self):
+        # finished sessions' transcripts keep getting bookkeeping lines (no timestamp, no conversation),
+        # which bumps the file's mtime; last active must stay at the last real message
+        three_h = self.now - 3 * 3600
+        self.state("j1", state="done", name="old", sessionId="s1", updatedAt=iso(three_h))
+        self.transcript("s1", [api_request(), assistant(1000, [tool_use("final step")], at=three_h),
+                               {"type": "artifact-autoreact-ledger"}], age=0)
+        self.transcript("s2", [{"type": "user", "isSidechain": True, "timestamp": iso(self.now)},
+                               {"type": "user", "timestamp": iso(self.now - 600)}], age=0)
+        self.state("j2", state="waiting", name="replied", sessionId="s2", updatedAt=iso(self.now - 3600))
+        rows = {r["id"]: r for r in self.ct.load_rows({})}
+        self.assertAlmostEqual(rows["j1"]["last"].timestamp(), three_h, delta=2)
+        self.assertAlmostEqual(rows["j2"]["last"].timestamp(), self.now - 600, delta=2)  # sidechain ignored
+
     def test_live_state_and_name_override_state_json(self):
         sid = self.working_session()
         live = {"job1": {"id": "job1", "kind": "background", "state": "blocked", "name": "renamed", "pid": 4}}

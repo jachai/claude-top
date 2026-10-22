@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-22
+
+### Fixed
+
+- LAST ACTIVE uses the time of a session's last message instead of its transcript file's modification time. Bookkeeping lines (such as artifact comment watching) keep touching finished sessions' transcripts, which made idle sessions look recently active.
+- The usage lines use `→` instead of `▶`. Some terminals draw `▶` as a two-cell emoji, which garbled the header on refresh.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added
@@ -46,5 +53,6 @@ All notable changes to this project are documented here. The format is based on
 - `--once` output and a demo with made-up data.
 
 [Unreleased]: https://github.com/jachai/claude-top/compare/v0.2.0...HEAD
+[0.2.1]: https://github.com/jachai/claude-top/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jachai/claude-top/compare/a033382...v0.2.0
 [0.1.0]: https://github.com/jachai/claude-top/commit/a033382
