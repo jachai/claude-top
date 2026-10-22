@@ -15,8 +15,9 @@ uv run --no-project --python 3.14 python -m unittest discover -s tests
 uvx pyflakes claude_top.py scripts tests
 ```
 
-Every test builds its own Claude config dir in a temp folder and sets `CLAUDE_TOP_LIVE=0`, so nothing reads your real
-`~/.claude` or runs `claude`. New tests should do the same.
+Every test builds its own Claude config dir in a temp folder and sets `CLAUDE_TOP_LIVE=0` and
+`CLAUDE_TOP_NO_UPDATE_CHECK=1`, so nothing reads your real `~/.claude`, runs `claude` or asks GitHub for updates. New
+tests should do the same.
 
 ## Demo and images
 

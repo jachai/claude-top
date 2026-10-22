@@ -254,7 +254,8 @@ def main():
         home = Path(tmp)
         build(home)
         env = {"CLAUDE_CONFIG_DIR": str(home), "CLAUDE_TOP_RATE_LIMITS": str(home / "claude-top" / "rate_limits.json"),
-               "CLAUDE_TOP_LIVE": "0", "HOME": str(home)}  # no real sessions from `claude agents` or the desktop app
+               "CLAUDE_TOP_LIVE": "0", "HOME": str(home),  # no real sessions from `claude agents` or the desktop app
+               "CLAUDE_TOP_NO_UPDATE_CHECK": "1"}  # and no request to GitHub
         if args.screenshot or args.gif or args.social:
             for path, make in ((args.screenshot, screenshot), (args.gif, gif), (args.social, social)):
                 if path:

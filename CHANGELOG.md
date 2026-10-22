@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-22
+
+### Added
+
+- The title bar shows claude-top's version.
+- A daily update check in the full-screen view: a background request asks GitHub for the latest release's version and caches the answer in `~/.claude/claude-top/update-check.json`, so it never slows startup and fails silently offline. `--once`, the status line and `init` never check. `CLAUDE_TOP_NO_UPDATE_CHECK=1` turns it off.
+- `u` updates claude-top when a newer release is out. It shows the command and asks first: `git pull --ff-only` for a git checkout, `uv tool upgrade` or `pipx upgrade` for those installs, and otherwise the `pip install -U` command to run yourself. After a successful update claude-top restarts with the same arguments.
+
 ## [0.2.1] - 2026-10-22
 
 ### Fixed
@@ -52,7 +60,8 @@ All notable changes to this project are documented here. The format is based on
 - `claude-top statusline` and `claude-top record`, which record plan limits from Claude Code's status-line input.
 - `--once` output and a demo with made-up data.
 
-[Unreleased]: https://github.com/jachai/claude-top/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jachai/claude-top/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jachai/claude-top/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jachai/claude-top/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jachai/claude-top/compare/a033382...v0.2.0
 [0.1.0]: https://github.com/jachai/claude-top/commit/a033382

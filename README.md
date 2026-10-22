@@ -50,6 +50,7 @@ claude-top --once       # print once and exit
 | `/` | text filter |
 | `+` `-` | refresh slower / faster |
 | `?` | help: every key and column |
+| `u` | update claude-top (offered in the footer when a newer release is out) |
 | `q` | quit |
 
 ## Reading it
@@ -75,7 +76,7 @@ python3 scripts/demo.py   # made-up sessions in a temp dir
 ## Notes
 
 - Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`). They aren't a public API, so a Claude Code update can break a column; please [open an issue](https://github.com/jachai/claude-top/issues/new/choose) if it does.
-- It only reads, except for its own files in `~/.claude/claude-top/` and, with `init`, the `statusLine` entry of `~/.claude/settings.json`. Nothing leaves your machine.
+- It reads only local files, and writes only its own files in `~/.claude/claude-top/` and, with `init`, the `statusLine` entry of `~/.claude/settings.json`. Once a day the full-screen view asks GitHub for the latest release's version number (nothing about you or your sessions is sent); turn that off with `CLAUDE_TOP_NO_UPDATE_CHECK=1`.
 - This is an independent project, not affiliated with Anthropic.
 
 MIT licensed.

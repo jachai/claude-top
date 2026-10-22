@@ -11,7 +11,8 @@
   claude-top record           same, but prints nothing (pipe your own status line's input into it)
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
-o sort, f state filter, / text filter, +/- refresh speed, space refresh now, ? help, q quit.
+o sort, f state filter, / text filter, +/- refresh speed, space refresh now, ? help, q quit,
+u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
 """
 import argparse
 import json
@@ -22,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +33,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -40,6 +42,11 @@ DATA_DIR = CLAUDE_DIR / "claude-top"
 RATE_LIMITS = Path(os.environ.get("CLAUDE_TOP_RATE_LIMITS") or DATA_DIR / "rate_limits.json")
 HISTORY = DATA_DIR / "usage-history.jsonl"
 HISTORY_KEEP_DAYS = 8
+UPDATE_CHECK = DATA_DIR / "update-check.json"
+UPDATE_EVERY = 86400
+UPDATE_URL = "https://api.github.com/repos/jachai/claude-top/releases/latest"
+RELEASES_URL = "https://github.com/jachai/claude-top/releases/latest"
+PACKAGE = "claude-agents-top"
 DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "plan-usage-history.json"
 
 TAIL_BYTES = 512 * 1024
@@ -58,6 +65,7 @@ LIMITS = [  # rate_limits key, label, window seconds, short key
 ]
 HEADER_ROWS = 4 + len(LIMITS)  # title, agents, one per limit, filter line, column header
 FOOTER_ROWS = 2
+KEYS = " enter attach  c copy  o sort  f state  / filter  +/- speed  ? help  q quit"
 
 _transcript_cache = {}
 _path_cache = {}
@@ -726,9 +734,14 @@ def help_section(title, pairs):
     return [title] + [f"  {k:<11}  {v}" for k, v in pairs]
 
 
-def help_lines(cols):
+def help_keys(latest=None):
+    """The keys, with u before ? and q when there is an update to offer."""
+    return HELP_KEYS[:-2] + [("u", f"update to {latest}")] + HELP_KEYS[-2:] if latest else HELP_KEYS
+
+
+def help_lines(cols, latest=None):
     """The help text: keys and usage beside the columns when cols allows, else one after the other."""
-    left = help_section("keys", HELP_KEYS) + [""] + help_section("usage", HELP_USAGE)
+    left = help_section("keys", help_keys(latest)) + [""] + help_section("usage", HELP_USAGE)
     right = help_section("columns", HELP_COLUMNS)
     lw = max(map(len, left))
     if lw + 4 + max(map(len, right)) + 4 <= cols:
@@ -758,6 +771,132 @@ def edge(left, label, right, width):
     return left + (text + "─" * fill)[:fill] + right
 
 
+# ---------------------------------------------------------------- updates
+
+
+def version_key(version):
+    """'v0.10.0' -> ((0, 10), True), or None if it isn't a version. A pre-release such as 0.3.0rc1 sorts before 0.3.0."""
+    m = re.match(r"v?(\d+(?:\.\d+)*)(.*)$", str(version).strip())
+    if not m:
+        return None
+    nums = [int(n) for n in m.group(1).split(".")]
+    while len(nums) > 1 and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums), not m.group(2)
+
+
+def is_newer(latest, current):
+    a, b = version_key(latest), version_key(current)
+    return bool(a and b and a > b)
+
+
+def check_due(cache, now):
+    checked = (cache or {}).get("checked")
+    return not isinstance(checked, (int, float)) or abs(now - checked) >= UPDATE_EVERY
+
+
+def fetch_latest(opener=None):
+    """The latest release's version on GitHub, or None on any failure (offline, rate-limited, a bad reply)."""
+    import urllib.request  # only the full-screen view asks, so the status line doesn't pay for the import
+
+    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": f"claude-top/{__version__}",
+                                                      "Accept": "application/vnd.github+json"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=3) as resp:
+            tag = json.loads(resp.read().decode()).get("tag_name")
+    except Exception:  # runs in a background thread: never let it reach the screen
+        return None
+    return tag.removeprefix("v") if isinstance(tag, str) and version_key(tag) else None
+
+
+def update_check(now):
+    """A released version newer than this one, or None. Asks GitHub at most once a day, failures included."""
+    if os.environ.get("CLAUDE_TOP_NO_UPDATE_CHECK", "") not in ("", "0"):
+        return None
+    cache = load_json(UPDATE_CHECK) or {}
+    if check_due(cache, now):
+        cache = {"checked": int(now), "latest": fetch_latest() or cache.get("latest")}
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(UPDATE_CHECK, cache)
+        except OSError:
+            pass
+    latest = cache.get("latest")
+    return latest if isinstance(latest, str) and is_newer(latest, __version__) else None
+
+
+def is_checkout(d):
+    """d is a git clone of claude-top, not some other repo the file was copied into."""
+    try:
+        return (d / ".git").exists() and PACKAGE in (d / "pyproject.toml").read_text()
+    except OSError:
+        return False
+
+
+def has_segment(path, *names):
+    parts = Path(path).parts
+    return any(parts[i:i + len(names)] == names for i in range(len(parts)))
+
+
+def update_command(script=__file__, prefix=sys.prefix):
+    """The command that updates this install, or None when we can't tell how it was installed."""
+    checkout = Path(script).resolve().parent
+    if is_checkout(checkout):
+        return ["git", "-C", str(checkout), "pull", "--ff-only"]
+    prefix = Path(prefix)
+    if (prefix / "uv-receipt.toml").exists() or has_segment(prefix, "uv", "tools"):
+        return ["uv", "tool", "upgrade", PACKAGE]
+    if (prefix / "pipx_metadata.json").exists() or has_segment(prefix, "pipx", "venvs"):
+        return ["pipx", "upgrade", PACKAGE]
+    return None
+
+
+def update_hint(latest):
+    return f" u update to {latest} "
+
+
+def footer_keys(latest):
+    return (update_hint(latest) if latest else "") + KEYS
+
+
+def update_prompt(cmd, latest):
+    return f" update to {latest}? y/n  $ {shlex.join(cmd)}"
+
+
+def manual_update(latest):
+    return f" {latest} is out: pip install -U {PACKAGE}, or {RELEASES_URL}"
+
+
+def restart_argv(argv=None):
+    """How to start again after an update: the claude-top command we ran as, else python and this file."""
+    argv = sys.argv if argv is None else argv
+    if os.path.basename(argv[0]) == "claude-top" and os.path.isfile(argv[0]):
+        return [os.path.abspath(argv[0])] + argv[1:]
+    return [sys.executable, os.path.abspath(__file__)] + argv[1:]
+
+
+def run_update(cmd, latest):
+    """Run cmd in the terminal and restart into the new version. Returns only after a failure, once you press Enter."""
+    print(f"updating claude-top to {latest}: {shlex.join(cmd)}", flush=True)
+    try:
+        code = subprocess.run(cmd).returncode
+    except OSError as e:
+        print(f"could not run {cmd[0]}: {e}")
+        code = None
+    if code == 0:
+        argv = restart_argv()
+        try:
+            os.execv(argv[0], argv)
+        except OSError as e:
+            sys.exit(f"updated, but could not restart ({e}): run claude-top again")
+    if code:
+        print(f"the update failed (exit {code}): see the output above")
+    try:
+        input("press Enter to go back to claude-top, or ctrl-c to quit ")
+    except EOFError:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------- full screen
 
 
@@ -775,6 +914,10 @@ class Top:
         self.message = ""
         self.help = None  # scroll offset while the help overlay is open
         self.last_load = 0.0
+        self.latest = None  # a newer release, once the background check finds one
+
+    def check_update(self):
+        self.latest = update_check(time.time())
 
     def colors(self):
         yellow = green = red = cyan = 0
@@ -822,7 +965,7 @@ class Top:
         h, w = self.scr.getmaxyx()
         now = datetime.now(timezone.utc)
         sessions, agents = summary(self.rows)
-        head = f" claude-top {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
+        head = f" claude-top {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
         self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
         self.put(1, 0, f" {agents}".ljust(w), curses.A_REVERSE)
         now_s = time.time()
@@ -858,12 +1001,13 @@ class Top:
 
         if self.view:
             self.put(h - 2, 0, fit(selected_detail(self.view[self.cursor]), w), curses.A_DIM)
-        keys = " enter attach  c copy  o sort  f state  / filter  +/- speed  ? help  q quit"
-        self.put(h - 1, 0, (self.message or keys).ljust(w), curses.A_REVERSE)
+        self.put(h - 1, 0, (self.message or footer_keys(self.latest)).ljust(w), curses.A_REVERSE)
+        if self.latest and not self.message:
+            self.put(h - 1, 0, update_hint(self.latest), curses.A_REVERSE | curses.A_BOLD)
 
     def draw_help(self):
         h, w = self.scr.getmaxyx()
-        y, x, box, self.help = help_box(help_lines(w), h, w, self.help)
+        y, x, box, self.help = help_box(help_lines(w, self.latest), h, w, self.help)
         for i, line in enumerate(box):
             if i in (0, len(box) - 1):
                 self.put(y + i, x, line, self.c_head)
@@ -902,10 +1046,22 @@ class Top:
             curses.curs_set(0)
             self.scr.timeout(200)
 
+    def confirm(self, label):
+        """True if the key pressed at label, on the footer line, is y."""
+        h, w = self.scr.getmaxyx()
+        self.put(h - 1, 0, label.ljust(w), curses.A_REVERSE)
+        self.scr.timeout(-1)
+        try:
+            return self.scr.getch() in (ord("y"), ord("Y"))
+        finally:
+            self.scr.timeout(200)
+
     def run(self):
+        """What to do on leaving: ("quit", None), ("attach", job id) or ("update", (command, version))."""
         curses.curs_set(0)
         self.colors()
         self.reload()
+        threading.Thread(target=self.check_update, daemon=True).start()
         self.scr.timeout(200)  # redraw the clock and check the refresh interval 5x a second
         while True:
             self.draw()
@@ -919,7 +1075,7 @@ class Top:
             if key != -1 and self.help is not None:
                 self.help_key(key)
             elif key in (ord("q"), 27):
-                return None
+                return "quit", None
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.cursor = min(last_idx, self.cursor + 1)
             elif key in (curses.KEY_UP, ord("k")):
@@ -933,7 +1089,7 @@ class Top:
             elif key == ord("G"):
                 self.cursor = last_idx
             elif key in (10, 13, curses.KEY_ENTER) and self.view:
-                return self.view[self.cursor]["id"]
+                return "attach", self.view[self.cursor]["id"]
             elif key == ord("c") and self.view:
                 cmd = f"claude attach {self.view[self.cursor]['id']}"
                 self.message = f" copied: {cmd}" if copy_to_clipboard(cmd) else f" {cmd}"
@@ -954,6 +1110,12 @@ class Top:
                 self.reload()
             elif key == ord("?"):
                 self.help = 0
+            elif key == ord("u") and self.latest:
+                cmd = update_command()
+                if not cmd:
+                    self.message = manual_update(self.latest)
+                elif self.confirm(update_prompt(cmd, self.latest)):
+                    return "update", (cmd, self.latest)
             if time.monotonic() - self.last_load >= self.interval:
                 self.reload()
 
@@ -1128,15 +1290,19 @@ def main():
         except BrokenPipeError:  # e.g. piped into head
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return
-    try:
-        target = curses.wrapper(lambda scr: Top(scr, args).run())
-    except KeyboardInterrupt:
-        return
-    if target:
+    while True:
         try:
-            os.execvp("claude", ["claude", "attach", target])
+            action, value = curses.wrapper(lambda scr: Top(scr, args).run())
+            if action != "update":
+                break
+            run_update(*value)  # returns only if the update failed and you went back
+        except KeyboardInterrupt:
+            return
+    if action == "attach":
+        try:
+            os.execvp("claude", ["claude", "attach", value])
         except OSError:
-            sys.exit(f"could not run `claude attach {target}`: is claude on your PATH?")
+            sys.exit(f"could not run `claude attach {value}`: is claude on your PATH?")
 
 
 if __name__ == "__main__":

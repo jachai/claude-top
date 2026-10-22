@@ -1,7 +1,8 @@
 """claude-top tests.
 
 Every test builds its own Claude config dir (state.json, transcripts, subagent metas, rate-limit
-snapshot, history) under a temp HOME, and never runs `claude` (CLAUDE_TOP_LIVE=0, live data is passed in).
+snapshot, history) under a temp HOME, never runs `claude` (CLAUDE_TOP_LIVE=0, live data is passed in) and never
+asks GitHub for updates (CLAUDE_TOP_NO_UPDATE_CHECK=1; the update tests stub the request).
 
     python -m unittest discover -s tests
 """
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -56,7 +58,8 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
         self.config = self.home / ".claude"
-        self.env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CLAUDE_TOP_LIVE": "0"}
+        self.env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CLAUDE_TOP_LIVE": "0",
+                    "CLAUDE_TOP_NO_UPDATE_CHECK": "1"}
         patcher = mock.patch.dict(os.environ, self.env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -448,6 +451,8 @@ class HelpTest(unittest.TestCase):
         for key in ("enter", "c ", "o ", "f ", "/ ", "+  -", "space", "? ", "q  esc"):
             self.assertIn("  " + key, text)
         self.assertIn("waiting", text)
+        self.assertNotIn("  u ", text)
+        self.assertIn("  u            update to 0.4.0", "\n".join(claude_top.help_lines(80, "0.4.0")))
 
     def test_help_is_two_columns_only_when_it_fits(self):
         narrow, wide = claude_top.help_lines(80), claude_top.help_lines(200)
@@ -502,7 +507,7 @@ class ScreenTest(Sandbox):
         if subprocess.run(probe, capture_output=True).returncode:
             raise unittest.SkipTest("no xterm-256color terminfo")
 
-    def run_screen(self, rows, cols, keys):
+    def run_screen(self, rows, cols, keys, env=None):
         import fcntl
         import pty
         import select
@@ -514,6 +519,7 @@ class ScreenTest(Sandbox):
             try:
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
                 os.environ.update(TERM="xterm-256color", PATH=str(self.home / "no-bin"))  # never reach a real `claude`
+                os.environ.update(env or {})
                 os.execv(sys.executable, [sys.executable, str(ROOT / "claude_top.py")])
             finally:
                 os._exit(127)
@@ -557,9 +563,177 @@ class ScreenTest(Sandbox):
         self.assertIn("any other key closes", text)
         self.assertIn("this help", text)
 
+    def test_cached_newer_release_is_offered_and_n_declines(self):
+        self.ct.DATA_DIR.mkdir(parents=True)
+        self.ct.UPDATE_CHECK.write_text(json.dumps({"checked": int(self.now), "latest": "9.9.9"}))
+        env = {"CLAUDE_TOP_NO_UPDATE_CHECK": "0", "HTTPS_PROXY": "http://127.0.0.1:9"}  # a fresh cache: no request
+        text = self.run_screen(24, 80, [b"u", b"n", b"?", b"x", b"q"], env)
+        self.assertIn(f"claude-top {self.ct.__version__} ", text)
+        self.assertIn("u update to 9.9.9", text)
+        self.assertIn("update to 9.9.9? y/n  $ git -C ", text)
+        self.assertEqual(json.loads(self.ct.UPDATE_CHECK.read_text())["checked"], int(self.now))
+
     def test_tiny_terminal_does_not_crash(self):
         for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing
             self.run_screen(rows, cols, [b"?", b"j", b"x", b"/", b"a\n", b"q"])
+
+
+class Reply:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class UpdateTest(Sandbox):
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CLAUDE_TOP_NO_UPDATE_CHECK")
+        self.fetch_latest = self.ct.fetch_latest
+        self.fetch = mock.Mock(return_value="9.0.0")
+        patcher = mock.patch.object(self.ct, "fetch_latest", self.fetch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def cache(self):
+        return json.loads(self.ct.UPDATE_CHECK.read_text())
+
+    def test_versions_compare_as_numbers(self):
+        newer = self.ct.is_newer
+        self.assertTrue(newer("0.10.0", "0.9.0"))
+        self.assertFalse(newer("0.9.0", "0.10.0"))
+        self.assertTrue(newer("v0.3.1", "0.3.0"))
+        self.assertTrue(newer("1.0", "0.9.9"))
+        self.assertFalse(newer("1.0", "1.0.0"))
+        self.assertFalse(newer("0.3.0", "0.3.0"))
+        self.assertFalse(newer("0.3.0rc1", "0.3.0"))  # a pre-release is older than its release
+        self.assertTrue(newer("0.3.0", "0.3.0rc1"))
+        self.assertFalse(newer("latest", "0.3.0"))
+        self.assertFalse(newer(None, "0.3.0"))
+
+    def test_cache_is_fresh_for_a_day(self):
+        due = self.ct.check_due
+        self.assertTrue(due(None, self.now))
+        self.assertTrue(due({"checked": "yesterday"}, self.now))
+        self.assertFalse(due({"checked": self.now - 23 * H}, self.now))
+        self.assertTrue(due({"checked": self.now - 25 * H}, self.now))
+        self.assertTrue(due({"checked": self.now + 2 * D}, self.now))  # a clock that went backwards
+
+    def test_checks_once_a_day_and_offers_only_newer(self):
+        self.assertEqual(self.ct.update_check(self.now), "9.0.0")
+        self.assertEqual(self.cache(), {"checked": int(self.now), "latest": "9.0.0"})
+        self.assertEqual(self.ct.update_check(self.now + 3 * H), "9.0.0")
+        self.assertEqual(self.fetch.call_count, 1)  # the second start read the cache
+        self.fetch.return_value = self.ct.__version__
+        self.assertIsNone(self.ct.update_check(self.now + 25 * H))
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_failure_is_cached_as_checked(self):
+        self.fetch.return_value = None
+        self.assertIsNone(self.ct.update_check(self.now))
+        self.assertEqual(self.cache(), {"checked": int(self.now), "latest": None})
+        self.assertIsNone(self.ct.update_check(self.now + H))
+        self.assertEqual(self.fetch.call_count, 1)  # no retry until tomorrow
+
+    def test_opt_out(self):
+        os.environ["CLAUDE_TOP_NO_UPDATE_CHECK"] = "1"
+        self.assertIsNone(self.ct.update_check(self.now))
+        self.fetch.assert_not_called()
+        self.assertFalse(self.ct.UPDATE_CHECK.exists())
+
+    def test_fetch_reads_the_tag_of_the_latest_release(self):
+        seen = {}
+
+        def opener(req, timeout):
+            seen.update(url=req.full_url, agent=req.get_header("User-agent"), timeout=timeout)
+            return Reply(b'{"tag_name": "v0.4.0", "name": "0.4.0"}')
+
+        self.assertEqual(self.fetch_latest(opener), "0.4.0")
+        self.assertEqual(seen["url"], "https://api.github.com/repos/jachai/claude-top/releases/latest")
+        self.assertTrue(seen["agent"].startswith("claude-top/"))
+        self.assertLessEqual(seen["timeout"], 5)
+
+    def test_fetch_failures_are_silent(self):
+        def raises(error):
+            def opener(req, timeout):
+                raise error
+            return opener
+
+        rate_limited = urllib.error.HTTPError(claude_top.UPDATE_URL, 403, "rate limit exceeded", {}, io.BytesIO())
+        self.addCleanup(rate_limited.close)
+        for opener in (raises(urllib.error.URLError("offline")), raises(rate_limited), raises(TimeoutError()),
+                       lambda req, timeout: Reply(b"<html>"),
+                       lambda req, timeout: Reply(b'{"message": "API rate limit exceeded"}'),
+                       lambda req, timeout: Reply(b'["v1.0.0"]'),
+                       lambda req, timeout: Reply(b'{"tag_name": "nightly"}')):
+            self.assertIsNone(self.fetch_latest(opener))
+
+    def test_once_never_checks(self):
+        argv = ["claude-top", "--once"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+            self.ct.main()
+        self.fetch.assert_not_called()
+        self.assertFalse(self.ct.UPDATE_CHECK.exists())
+
+    def test_install_method_picks_the_command(self):
+        checkout = self.home.resolve() / "src" / "claude-top"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "pyproject.toml").write_text('name = "claude-agents-top"\n')
+        site = "lib/python3.12/site-packages/claude_top.py"
+        uv_env = self.home / ".local/share/uv/tools/claude-agents-top"
+        pipx_env = self.home / ".local/share/pipx/venvs/claude-agents-top"
+        other_repo = self.home / "dotfiles"
+        (other_repo / ".git").mkdir(parents=True)
+        cmd = self.ct.update_command
+        self.assertEqual(cmd(checkout / "claude_top.py", "/usr"), ["git", "-C", str(checkout), "pull", "--ff-only"])
+        self.assertEqual(cmd(uv_env / site, uv_env), ["uv", "tool", "upgrade", "claude-agents-top"])
+        self.assertEqual(cmd(pipx_env / site, pipx_env), ["pipx", "upgrade", "claude-agents-top"])
+        custom = self.home / "tools" / "ct"  # UV_TOOL_DIR elsewhere: uv's receipt file still says it is uv
+        custom.mkdir(parents=True)
+        (custom / "uv-receipt.toml").write_text("")
+        self.assertEqual(cmd(custom / site, custom)[0], "uv")
+        self.assertIsNone(cmd(other_repo / "claude_top.py", "/usr"))  # someone else's repo: never pull it
+        self.assertIsNone(cmd(self.home / "venv" / site, self.home / "venv"))
+        self.assertIn("pip install -U claude-agents-top", self.ct.manual_update("0.4.0"))
+
+    def test_footer_and_prompt(self):
+        self.assertEqual(self.ct.footer_keys(None), self.ct.KEYS)
+        self.assertTrue(self.ct.footer_keys("0.4.0").startswith(" u update to 0.4.0  enter attach"))
+        prompt = self.ct.update_prompt(["git", "-C", "/my dir", "pull", "--ff-only"], "0.4.0")
+        self.assertEqual(prompt, " update to 0.4.0? y/n  $ git -C '/my dir' pull --ff-only")
+
+    def test_restart_uses_the_command_it_was_run_as(self):
+        exe = self.home / "bin" / "claude-top"
+        exe.parent.mkdir()
+        exe.write_text("#!/bin/sh\n")
+        self.assertEqual(self.ct.restart_argv([str(exe), "-s", "waiting"]), [str(exe), "-s", "waiting"])
+        script = os.path.abspath(self.ct.__file__)
+        self.assertEqual(self.ct.restart_argv([script, "-i", "5"]), [sys.executable, script, "-i", "5"])
+
+    def test_failed_update_waits_for_enter(self):
+        out = io.StringIO()
+        with mock.patch("builtins.input", return_value="") as asked, contextlib.redirect_stdout(out), \
+                mock.patch.object(self.ct.os, "execv") as execv:
+            self.ct.run_update([sys.executable, "-c", "raise SystemExit(3)"], "9.0.0")
+            self.ct.run_update([str(self.home / "no-such-tool")], "9.0.0")
+        execv.assert_not_called()
+        self.assertEqual(asked.call_count, 2)
+        self.assertIn("failed (exit 3)", out.getvalue())
+        self.assertIn("could not run", out.getvalue())
+
+    def test_successful_update_restarts(self):
+        with mock.patch.object(self.ct.os, "execv") as execv, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(sys, "argv", [os.path.abspath(self.ct.__file__), "-i", "5"]), \
+                mock.patch("builtins.input", return_value=""):  # execv is stubbed, so run_update goes on
+            self.ct.run_update([sys.executable, "-c", "pass"], "9.0.0")
+        execv.assert_called_once_with(sys.executable, [sys.executable, os.path.abspath(self.ct.__file__), "-i", "5"])
 
 
 class InitTest(Sandbox):
