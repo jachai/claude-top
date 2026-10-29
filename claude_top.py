@@ -33,7 +33,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -494,8 +494,9 @@ def guide_role(session_ids, name):
     """(role, ledger) for a session-guide (github.com/jachai/session-guide) session; role is None for any other.
 
     "guide" is the active Sessions Manager, "retired" one that handed over to a new guide. The skill keeps a marker
-    per session in ~/.claude/session-guide/guides/: the ledger's path for a guide, `retired`, or `guided` for a
-    worker. A session without a marker is told by the skill's default titles instead.
+    per session in ~/.claude/session-guide/guides/: the ledger's path for a guide, `retired`, or a worker's state
+    (`guided`, `unguided`, `done` for one the guide closed). Only a path is a guide, so a new worker state never
+    pins its session on top. A session without a marker is told by the skill's default titles instead.
     """
     for sid in session_ids:
         if not re.fullmatch(r"[0-9A-Za-z-]+", sid or ""):  # it names a file: no path tricks from state.json
@@ -506,7 +507,7 @@ def guide_role(session_ids, name):
             continue
         if content == "retired":
             return "retired", None
-        if content and content not in ("guided", "unguided"):
+        if "/" in content or content.endswith(".md"):
             return "guide", content
         return None, None
     if RETIRED_TITLE.match(name):

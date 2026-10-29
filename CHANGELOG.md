@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-29
+
+### Fixed
+
+- A session that session-guide closed (its `done` marker, session-guide 0.1.3) is no longer taken for the active guide and pinned on top. Only a marker holding a ledger path counts as a guide.
+
 ## [0.4.0] - 2026-10-29
 
 ### Added
@@ -66,7 +72,8 @@ All notable changes to this project are documented here. The format is based on
 - `claude-top statusline` and `claude-top record`, which record plan limits from Claude Code's status-line input.
 - `--once` output and a demo with made-up data.
 
-[Unreleased]: https://github.com/jachai/claude-top/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jachai/claude-top/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/jachai/claude-top/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jachai/claude-top/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jachai/claude-top/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jachai/claude-top/compare/v0.2.0...v0.2.1

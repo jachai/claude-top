@@ -394,12 +394,14 @@ class RowsTest(Sandbox):
         self.guide_marker("so", "retired")
         self.state("w", state="done", name="\U0001f7e5\U0001f7e5 Sessions Manager (1 of 1) \U0001f7e5\U0001f7e5", sessionId="sw")
         self.guide_marker("sw", "guided")  # the marker wins over the title
+        self.state("d", state="done", name="\u2705 closed worker", sessionId="sd")
+        self.guide_marker("sd", "done")  # a closed worker, not a ledger path
         self.state("t1", state="working", name="\U0001f7e5\U0001f7e5 Sessions Manager (2 of 3) \U0001f7e5\U0001f7e5")
         self.state("t2", state="done", name="\U0001f7e9\U0001f7e9 Sessions Manager (retired) \U0001f7e9\U0001f7e9")
         self.state("evil", state="done", name="x", sessionId="../../jobs/g/state.json")
         rows = self.rows()
         self.assertEqual({i: r["guide"] for i, r in rows.items()},
-                         {"g": "guide", "old": "retired", "w": None, "t1": "guide", "t2": "retired", "evil": None})
+                         {"g": "guide", "old": "retired", "w": None, "d": None, "t1": "guide", "t2": "retired", "evil": None})
         self.assertEqual(rows["g"]["ledger"], "/home/me/.claude/session-guide/guide-1/ledger.md")
         self.assertIn("session guide, ledger /home/me/", self.ct.selected_detail(rows["g"]))
 
