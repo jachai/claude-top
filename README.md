@@ -48,10 +48,15 @@ claude-top --once       # print once and exit
 | `o` | sort: last active, created, context, agents, name |
 | `f` | filter by state |
 | `/` | text filter |
+| `r` | show / hide retired session guides |
 | `+` `-` | refresh slower / faster |
 | `?` | help: every key and column |
 | `u` | update claude-top (offered in the footer when a newer release is out) |
 | `q` | quit |
+
+### With session-guide
+
+If you run [session-guide](https://github.com/jachai/session-guide), claude-top knows its sessions: the active guide (🟥🟥 Sessions Manager) is always on top, and guides that handed over (🟩🟩 retired) are hidden. Press `r` or pass `--retired` to see them. It reads the skill's markers in `~/.claude/session-guide/guides/`, and falls back to its default titles.
 
 ## Reading it
 
@@ -75,7 +80,7 @@ python3 scripts/demo.py   # made-up sessions in a temp dir
 
 ## Notes
 
-- Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`). They aren't a public API, so a Claude Code update can break a column; please [open an issue](https://github.com/jachai/claude-top/issues/new/choose) if it does.
+- Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`, and session-guide's `~/.claude/session-guide/guides`). They aren't a public API, so a Claude Code update can break a column; please [open an issue](https://github.com/jachai/claude-top/issues/new/choose) if it does.
 - It reads only local files, and writes only its own files in `~/.claude/claude-top/` and, with `init`, the `statusLine` entry of `~/.claude/settings.json`. Once a day the full-screen view asks GitHub for the latest release's version number (nothing about you or your sessions is sent); turn that off with `CLAUDE_TOP_NO_UPDATE_CHECK=1`.
 - This is an independent project, not affiliated with Anthropic.
 

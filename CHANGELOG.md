@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-29
+
+### Added
+
+- [session-guide](https://github.com/jachai/session-guide) support. The active guide session (the 🟥🟥 Sessions Manager) is always the first row, whatever the sort, and retired guides (🟩🟩) are hidden. `r` shows or hides them, and the filter line says how many are hidden; `--retired` shows them from the start, `--once` included. Roles come from session-guide's marker files in `~/.claude/session-guide/guides/`, or from its default titles when a session has no marker. The selected guide's detail line shows its ledger.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added
@@ -60,7 +66,8 @@ All notable changes to this project are documented here. The format is based on
 - `claude-top statusline` and `claude-top record`, which record plan limits from Claude Code's status-line input.
 - `--once` output and a demo with made-up data.
 
-[Unreleased]: https://github.com/jachai/claude-top/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jachai/claude-top/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jachai/claude-top/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jachai/claude-top/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jachai/claude-top/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jachai/claude-top/compare/a033382...v0.2.0

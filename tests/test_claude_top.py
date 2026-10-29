@@ -383,6 +383,39 @@ class RowsTest(Sandbox):
         self.assertEqual(ids(text="BILLING"), ["b", "a"])
         self.assertEqual(ids(sort="name"), ["a", "b", "c"])
 
+    def guide_marker(self, sid, content):
+        self.ct.GUIDES.mkdir(parents=True, exist_ok=True)
+        (self.ct.GUIDES / sid).write_text(content + "\n")
+
+    def test_session_guide_roles_from_markers_then_titles(self):
+        self.state("g", state="blocked", name="renamed by hand", sessionId="sg")
+        self.guide_marker("sg", "/home/me/.claude/session-guide/guide-1/ledger.md")
+        self.state("old", state="done", name="whatever", sessionId="so")
+        self.guide_marker("so", "retired")
+        self.state("w", state="done", name="\U0001f7e5\U0001f7e5 Sessions Manager (1 of 1) \U0001f7e5\U0001f7e5", sessionId="sw")
+        self.guide_marker("sw", "guided")  # the marker wins over the title
+        self.state("t1", state="working", name="\U0001f7e5\U0001f7e5 Sessions Manager (2 of 3) \U0001f7e5\U0001f7e5")
+        self.state("t2", state="done", name="\U0001f7e9\U0001f7e9 Sessions Manager (retired) \U0001f7e9\U0001f7e9")
+        self.state("evil", state="done", name="x", sessionId="../../jobs/g/state.json")
+        rows = self.rows()
+        self.assertEqual({i: r["guide"] for i, r in rows.items()},
+                         {"g": "guide", "old": "retired", "w": None, "t1": "guide", "t2": "retired", "evil": None})
+        self.assertEqual(rows["g"]["ledger"], "/home/me/.claude/session-guide/guide-1/ledger.md")
+        self.assertIn("session guide, ledger /home/me/", self.ct.selected_detail(rows["g"]))
+
+    def test_guide_pinned_first_and_retired_guides_hidden(self):
+        self.state("a", state="working", name="alpha", updatedAt=iso(self.now - 10), sessionId="sa")
+        self.state("z", state="blocked", name="zulu guide", updatedAt=iso(self.now - 500), sessionId="sz")
+        self.guide_marker("sz", "/ledger.md")
+        self.state("r", state="done", name="retired one", updatedAt=iso(self.now - 5), sessionId="sr")
+        self.guide_marker("sr", "retired")
+        rows = list(self.rows().values())
+        for sort in self.ct.SORTS:
+            self.assertEqual([r["id"] for r in self.ct.select(rows, None, None, sort)], ["z", "a"], sort)
+        self.assertEqual([r["id"] for r in self.ct.select(rows, None, None, "last active", retired=True)], ["z", "r", "a"])
+        self.assertEqual([r["id"] for r in self.ct.select(rows, "working", None, "last active")], ["a"])  # filters still apply
+        self.assertEqual(self.ct.retired_count(rows), 1)
+
     def test_summary_lines(self):
         sid = self.working_session()
         self.subagent(sid, "fresh", finished=False)
@@ -437,6 +470,13 @@ class CliTest(Sandbox):
         self.assertEqual(len(self.ct.HISTORY.read_text().splitlines()), 1)
         out = self.run_cli("record", stdin="not json")
         self.assertEqual((out.returncode, out.stdout), (0, ""))
+
+    def test_once_hides_retired_guides_unless_asked(self):
+        self.state("r1", state="done", name="handed over", sessionId="sr")
+        self.ct.GUIDES.mkdir(parents=True)
+        (self.ct.GUIDES / "sr").write_text("retired\n")
+        self.assertNotIn("handed over", self.run_cli("--once").stdout)
+        self.assertIn("handed over", self.run_cli("--once", "--retired").stdout)
 
     def test_version(self):
         out = self.run_cli("--version")
@@ -572,6 +612,15 @@ class ScreenTest(Sandbox):
         self.assertIn("u update to 9.9.9", text)
         self.assertIn("update to 9.9.9? y/n  $ git -C ", text)
         self.assertEqual(json.loads(self.ct.UPDATE_CHECK.read_text())["checked"], int(self.now))
+
+    def test_r_toggles_retired_guides(self):
+        self.state("r1", state="done", name="handed over", sessionId="sr")
+        self.ct.GUIDES.mkdir(parents=True)
+        (self.ct.GUIDES / "sr").write_text("retired\n")
+        text = self.run_screen(24, 160, [b"r", b"q"])
+        self.assertIn("retired guides: 1 hidden (r)", text)
+        self.assertIn("shown (r)", text)  # curses repaints only what changed on the line
+        self.assertIn("handed over", text)
 
     def test_tiny_terminal_does_not_crash(self):
         for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing

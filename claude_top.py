@@ -11,8 +11,8 @@
   claude-top record           same, but prints nothing (pipe your own status line's input into it)
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
-o sort, f state filter, / text filter, +/- refresh speed, space refresh now, ? help, q quit,
-u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
+o sort, f state filter, / text filter, r show retired guides, +/- refresh speed, space refresh now, ? help,
+q quit, u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
 """
 import argparse
 import json
@@ -33,7 +33,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -47,6 +47,9 @@ UPDATE_EVERY = 86400
 UPDATE_URL = "https://api.github.com/repos/jachai/claude-top/releases/latest"
 RELEASES_URL = "https://github.com/jachai/claude-top/releases/latest"
 PACKAGE = "claude-agents-top"
+GUIDES = CLAUDE_DIR / "session-guide" / "guides"  # session-guide's marker per session: a ledger path, retired or guided
+GUIDE_TITLE = re.compile("^\U0001f7e5\U0001f7e5 Sessions Manager")  # session-guide's default titles, for a missing marker
+RETIRED_TITLE = re.compile("^\U0001f7e9\U0001f7e9 Sessions Manager \\(retired\\)")
 DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "plan-usage-history.json"
 
 TAIL_BYTES = 512 * 1024
@@ -487,6 +490,30 @@ def recently_written(path, minutes=SUBAGENT_IDLE_MINUTES):
         return False
 
 
+def guide_role(session_ids, name):
+    """(role, ledger) for a session-guide (github.com/jachai/session-guide) session; role is None for any other.
+
+    "guide" is the active Sessions Manager, "retired" one that handed over to a new guide. The skill keeps a marker
+    per session in ~/.claude/session-guide/guides/: the ledger's path for a guide, `retired`, or `guided` for a
+    worker. A session without a marker is told by the skill's default titles instead.
+    """
+    for sid in session_ids:
+        if not re.fullmatch(r"[0-9A-Za-z-]+", sid or ""):  # it names a file: no path tricks from state.json
+            continue
+        try:
+            content = (GUIDES / sid).read_text().strip()
+        except OSError:
+            continue
+        if content == "retired":
+            return "retired", None
+        if content and content not in ("guided", "unguided"):
+            return "guide", content
+        return None, None
+    if RETIRED_TITLE.match(name):
+        return "retired", None
+    return ("guide" if GUIDE_TITLE.match(name) else None), None
+
+
 def live_sessions():
     """Live state per session from `claude agents --json --all`; state.json lags it. {} if unavailable."""
     if os.environ.get("CLAUDE_TOP_LIVE") == "0" or not shutil.which("claude"):
@@ -565,6 +592,8 @@ def load_rows(live_list=None):
         if not last:
             continue
         result = state["output"].get("result") if isinstance(state.get("output"), dict) else None
+        name = clean(state.get("name") or state.get("intent") or job_id)
+        guide, ledger = guide_role((state.get("sessionId"), state.get("resumeSessionId")), name)
         note = state.get("needs") or (result if state.get("state") in ("done", "review") else None) or state.get("detail") or ""
         newest = t["last_ts"] or t["mtime"]
         stale_note = updated is None or (newest and (newest - updated).total_seconds() > 5)
@@ -574,7 +603,7 @@ def load_rows(live_list=None):
             "id": clean(job_id),
             "kind": live_entry.get("kind") or "background",
             "state": state.get("state") or "?",
-            "name": clean(state.get("name") or state.get("intent") or job_id),
+            "name": name,
             "note": clean(note),
             "search": " ".join(str(state.get(k) or "") for k in ("name", "intent", "needs", "detail", "cwd")).lower(),
             "cwd": clean(state.get("cwd") or ""),
@@ -587,12 +616,15 @@ def load_rows(live_list=None):
             "agents": agents,
             "bg": background,
             "bg_kinds": [clean(k) for k in bg_kinds],
+            "guide": guide,
+            "ledger": clean(ledger or ""),
         })
     return rows
 
 
-def select(rows, state, text, sort):
-    out = [r for r in rows if state in (None, "all") or r["state"] == state]
+def select(rows, state, text, sort, retired=False):
+    """The rows to show, sorted; the active guide always comes first and retired guides only with `retired`."""
+    out = [r for r in rows if (state in (None, "all") or r["state"] == state) and (retired or r["guide"] != "retired")]
     if text:
         text = text.lower()
         out = [r for r in out if text in r["search"] or text in r["id"].lower()]
@@ -603,7 +635,12 @@ def select(rows, state, text, sort):
         "agents": lambda r: (r["agents"]["running"], r["agents"]["total"]),
         "name": lambda r: r["name"].lower(),
     }[sort]
-    return sorted(out, key=key, reverse=sort != "name")
+    out = sorted(out, key=key, reverse=sort != "name")
+    return [r for r in out if r["guide"] == "guide"] + [r for r in out if r["guide"] != "guide"]
+
+
+def retired_count(rows):
+    return sum(1 for r in rows if r["guide"] == "retired")
 
 
 COLUMNS = [
@@ -678,6 +715,8 @@ def summary(rows):
 def selected_detail(r):
     a = r["agents"]
     parts = [f" {r['id']}  {r['cwd']}  session {r['session']}"]
+    if r["guide"] == "guide":
+        parts.append("session guide" + (f", ledger {r['ledger']}" if r["ledger"] else ""))
     if a["total"]:
         models = ", ".join(f"{m} {n}" for m, n in sorted(a["models"].items(), key=lambda kv: -kv[1]))
         parts.append(f"subagents {a['total']} ({models})")
@@ -698,7 +737,7 @@ def print_once(args):
     for w in usage.windows(now_s):
         print("".join(text for text, _ in usage_segments(w, now_s))[:width])
     print(plain_line([h for h, _ in COLUMNS]) + "  NOTE")
-    for r in select(rows, args.state, args.grep, "last active")[: args.n or None]:
+    for r in select(rows, args.state, args.grep, "last active", args.retired)[: args.n or None]:
         print(row_line(row_cells(r, now, args.window), r["note"], width))
 
 
@@ -712,7 +751,8 @@ def row_line(cells, note, width):
 HELP_KEYS = [
     ("↑ ↓  j k", "move"), ("PgUp PgDn", "page up / down"), ("g  G", "top / bottom"),
     ("enter", "attach to the session"), ("c", "copy the attach command"), ("o", "next sort order"),
-    ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("+  -", "refresh slower / faster"),
+    ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("r", "show / hide retired guides"),
+    ("+  -", "refresh slower / faster"),
     ("space", "refresh now"), ("?", "this help"), ("q  esc", "quit"),
 ]
 HELP_USAGE = [
@@ -727,6 +767,7 @@ HELP_COLUMNS = [
     ("SPAWNED", "subagents started in total"), ("BG", "background shells, monitors, crons"),
     ("CTX", "context tokens in use"), ("CTX %", "share of the context window (-w)"),
     ("NAME  NOTE", "name; its question, result or step"),
+    ("", "the session guide is always first"),
 ]
 
 
@@ -907,6 +948,7 @@ class Top:
         self.window = args.window
         self.state = args.state or "all"
         self.text = args.grep or ""
+        self.retired = args.retired
         self.sort = "last active"
         self.usage = Usage(args.rate_hours)
         self.rows, self.view = [], []
@@ -941,7 +983,7 @@ class Top:
         selected = self.view[self.cursor]["id"] if (keep and self.view) else None
         self.usage.refresh()
         self.rows = load_rows()
-        self.view = select(self.rows, self.state, self.text, self.sort)
+        self.view = select(self.rows, self.state, self.text, self.sort, self.retired)
         ids = [r["id"] for r in self.view]
         if selected in ids:
             self.cursor = ids.index(selected)
@@ -974,6 +1016,9 @@ class Top:
             for text, level in usage_segments(win, now_s):
                 x = self.put(2 + i, x, text, self.c_level.get(level, 0))
         flt = f" sort: {self.sort}   state: {STATE_LABEL.get(self.state, self.state)}   filter: {self.text or '-'}   showing {len(self.view)}/{len(self.rows)}"
+        retired = retired_count(self.rows)
+        if retired:
+            flt += f"   retired guides: {'shown' if self.retired else f'{retired} hidden'} (r)"
         self.put(HEADER_ROWS - 2, 0, flt, curses.A_DIM)
         self.put(HEADER_ROWS - 1, 0, plain_line([hd for hd, _ in COLUMNS]) + "  NOTE", self.c_head)
 
@@ -1102,6 +1147,9 @@ class Top:
             elif key == ord("/"):
                 self.text = self.prompt(" filter: ")
                 self.reload(keep=False)
+            elif key == ord("r"):
+                self.retired = not self.retired
+                self.reload()
             elif key in (ord("+"), ord("=")):
                 self.interval = min(60, self.interval * 2)
             elif key == ord("-"):
@@ -1276,6 +1324,7 @@ def main():
     ap.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
                     help=f"context window size for the CTX %% column (default {DEFAULT_WINDOW:,} tokens)")
     ap.add_argument("--rate-hours", type=float, default=3.0, help="hours of history behind the 'now' speed (default 3)")
+    ap.add_argument("--retired", action="store_true", help="show retired session guides (hidden by default; r toggles)")
     ap.add_argument("--once", action="store_true", help="print once and exit")
     ap.add_argument("-n", type=int, default=30, help="with --once: rows to print (0 = all)")
     args = ap.parse_args()
