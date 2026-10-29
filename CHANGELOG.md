@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+### Added
+
+- Sessions sit in sections, like Claude Code's agents view: **needs input** and **working** open, while **review**, **done**, **stopped** and **idle 1d+** each fold into one line that says how many sessions it holds, when the newest was last active, and their names. Enter or a mouse click on a section's line opens or closes it, `→` `←` do the same, and `e` opens every section or puts them back. The filter line counts what is folded. A state or text filter shows plain rows, with no sections. `--once` prints the same sections.
+- `--expand` starts with every section open; `--idle-hours` (or `CLAUDE_TOP_IDLE_HOURS`, default 24) sets when a quiet session counts as idle; `--no-mouse` leaves the mouse to the terminal.
+- session-guide workers the guide has finished with show as done instead of waiting: a `done` marker, or a DONE / RETIRED / STOOD DOWN / CLOSED Level against the session's id in the active guide's ledger (`## Sessions` table). A worker that is working stays working.
+
+### Changed
+
+- The footer drops `+/- speed` to fit 80 columns; `?` help still lists it.
+
 ## [0.4.1] - 2026-10-29
 
 ### Fixed
@@ -72,7 +84,8 @@ All notable changes to this project are documented here. The format is based on
 - `claude-top statusline` and `claude-top record`, which record plan limits from Claude Code's status-line input.
 - `--once` output and a demo with made-up data.
 
-[Unreleased]: https://github.com/jachai/claude-top/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/jachai/claude-top/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jachai/claude-top/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jachai/claude-top/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jachai/claude-top/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jachai/claude-top/compare/v0.2.1...v0.3.0

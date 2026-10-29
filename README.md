@@ -38,12 +38,17 @@ claude-top              # full screen, refreshes every 2s
 claude-top -s waiting   # only sessions waiting for you (Claude Code calls it "blocked"; -s blocked works too)
 claude-top -g billing   # text filter
 claude-top --once       # print once and exit
+claude-top --expand     # start with every section open
 ```
+
+Sessions sit in sections, like Claude Code's own agents view: **needs input** and **working** are open, while **review**, **done**, **stopped** and **idle 1d+** (anything with no activity for a day, whatever its state; `--idle-hours` changes it) are each folded into one line with how many sessions it holds and their names. So what is still going on is all you see. Enter or a click on a section's line opens or closes it, `→` `←` do the same from the keyboard, and `e` opens every section or puts them back. A state or text filter shows plain rows, no sections. Clicking needs the mouse; `--no-mouse` leaves it to your terminal for selecting text.
 
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` | move |
-| `enter` | open the session (`claude attach <id>`) |
+| `enter` | open the session (`claude attach <id>`), or open / close a section |
+| `→` `←` / click | open / close a section (a click on a session selects it) |
+| `e` | open every section, or put them back |
 | `c` | copy the attach command |
 | `o` | sort: last active, created, context, agents, name |
 | `f` | filter by state |
@@ -57,6 +62,8 @@ claude-top --once       # print once and exit
 ### With session-guide
 
 If you run [session-guide](https://github.com/jachai/session-guide), claude-top knows its sessions: the active guide (🟥🟥 Sessions Manager) is always on top, and guides that handed over (🟩🟩 retired) are hidden. Press `r` or pass `--retired` to see them. It reads the skill's markers in `~/.claude/session-guide/guides/`, and falls back to its default titles.
+
+A worker the guide has finished with shows as **done**, not waiting on you, even while Claude Code still lists it under needs input: either its marker says `done`, or the active guide's ledger lists it in the `## Sessions` table with a Level of DONE, RETIRED, STOOD DOWN or CLOSED. A worker that is actually working stays in working.
 
 ## Reading it
 

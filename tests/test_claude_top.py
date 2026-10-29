@@ -401,7 +401,7 @@ class RowsTest(Sandbox):
         self.state("evil", state="done", name="x", sessionId="../../jobs/g/state.json")
         rows = self.rows()
         self.assertEqual({i: r["guide"] for i, r in rows.items()},
-                         {"g": "guide", "old": "retired", "w": None, "d": None, "t1": "guide", "t2": "retired", "evil": None})
+                         {"g": "guide", "old": "retired", "w": None, "d": "closed", "t1": "guide", "t2": "retired", "evil": None})
         self.assertEqual(rows["g"]["ledger"], "/home/me/.claude/session-guide/guide-1/ledger.md")
         self.assertIn("session guide, ledger /home/me/", self.ct.selected_detail(rows["g"]))
 
@@ -417,6 +417,55 @@ class RowsTest(Sandbox):
         self.assertEqual([r["id"] for r in self.ct.select(rows, None, None, "last active", retired=True)], ["z", "r", "a"])
         self.assertEqual([r["id"] for r in self.ct.select(rows, "working", None, "last active")], ["a"])  # filters still apply
         self.assertEqual(self.ct.retired_count(rows), 1)
+
+    def test_sections_fold_finished_and_idle_sessions(self):
+        self.state("a", state="working", name="alpha", updatedAt=iso(self.now - 10))
+        self.state("b", state="blocked", name="beta", updatedAt=iso(self.now - 20))
+        self.state("c", state="done", name="gamma", updatedAt=iso(self.now - 30))
+        self.state("d", state="done", name="delta", updatedAt=iso(self.now - 3 * D))
+        self.state("s", state="stopped", name="sigma", updatedAt=iso(self.now - 40))
+        self.state("o", state="blocked", name="omega", updatedAt=iso(self.now - 2 * D))  # waiting, but for 2 days
+        self.state("g", state="done", name="guide", updatedAt=iso(self.now - 50), sessionId="sg")
+        self.guide_marker("sg", "/ledger.md")
+        rows, now = self.ct.select(list(self.rows().values()), None, None, "last active"), datetime.now(timezone.utc)
+        ids = lambda view: [r["id"] for r in view]
+        view = self.ct.layout(rows, self.ct.default_open(), now)
+        self.assertEqual(ids(view), ["g", "group:blocked", "b", "group:working", "a", "group:done", "group:stopped", "group:idle"])
+        self.assertEqual(ids(self.ct.layout(rows, self.ct.default_open(True), now)),
+                         ["g", "group:blocked", "b", "group:working", "a", "group:done", "c", "d", "group:stopped", "s",
+                          "group:idle", "o"])
+        self.assertEqual(ids(self.ct.layout(rows, set(), now, idle_hours=72)),
+                         ["g", "group:blocked", "group:working", "group:done", "group:stopped"])  # o isn't idle yet
+        lines = {r["group"]: self.ct.group_line(r, now, 200) for r in view if r.get("group")}
+        self.assertRegex(lines["done"], r"^ ▸ done\s+2 sessions · last active \d+s ago  ·  gamma, delta$")
+        self.assertRegex(lines["idle"], r"^ ▸ idle 1d\+\s+1 session · last active 2d ago \(1 waiting\)  ·  omega$")
+        self.assertRegex(lines["blocked"], r"^ ▾ needs input\s+1 session · last active \d+s ago$")  # open: no names
+        self.assertEqual(self.ct.folded_count(view), 4)
+        self.assertEqual(self.ct.selected_detail(view[-1]), " idle 1d+: o omega")
+
+    def test_session_guide_done_workers_are_not_waiting(self):
+        ledger = self.home / "ledger.md"
+        ledger.write_text("\n".join([
+            "# guide ledger", "## Streams", "| Stream | Where now |", "|---|---|", "| other [cccccc] | DONE |",
+            "## Sessions", "| Title [id6 claude-top] | Level | Role |", "|---|---|---|",
+            "| (g) finished worker [aaaaaa] | DONE, HANDED OFF 13:38 | x |",
+            "| (g) live worker [bbbbbb] | MANAGED (guide-started) | x |",
+            "| (g) busy again [dddddd] | DONE 12:00 | x |",
+            "| 🟩🟩 old guide [eeeeee] | RETIRED 12:12 | old guide |", ""]))
+        self.state("guide1", state="working", name="guide", sessionId="sg")
+        self.guide_marker("sg", str(ledger))
+        for job, state in (("aaaaaa11", "blocked"), ("bbbbbb11", "blocked"), ("cccccc11", "blocked"),
+                           ("dddddd11", "working"), ("eeeeee11", "review")):
+            self.state(job, state=state, name=job, needs="Which one?")
+        self.state("ffffff11", state="blocked", name="closed by marker", needs="?", sessionId="sf")
+        self.guide_marker("sf", "done")
+        rows = self.rows()
+        self.assertEqual({i: r["state"] for i, r in rows.items() if i != "guide1"},
+                         {"aaaaaa11": "done", "bbbbbb11": "blocked", "cccccc11": "blocked", "dddddd11": "working",
+                          "eeeeee11": "done", "ffffff11": "done"})
+        self.assertEqual(rows["aaaaaa11"]["note"], "session guide: DONE, HANDED OFF 13:38")
+        self.assertIn("done per the session guide", self.ct.selected_detail(rows["ffffff11"]))
+        self.assertEqual(self.ct.ledger_done(str(self.home / "missing.md")), {})
 
     def test_summary_lines(self):
         sid = self.working_session()
@@ -443,9 +492,11 @@ class CliTest(Sandbox):
         self.assertIn("38% used", lines[2])
         self.assertIn("54% used", lines[3])
         self.assertTrue(lines[4].startswith("LAST ACTIVE") and lines[4].endswith("NOTE"))
-        self.assertIn("working", lines[5])
+        self.assertRegex(lines[5], r"^ ▾ needs input\s+1 session · last active \d+m ago$")
         self.assertRegex(lines[6], r"asker\s+Which one\?$")
         self.assertIn("waiting", lines[6])
+        self.assertTrue(lines[7].startswith(" ▾ working "), lines[7])
+        self.assertIn("working", lines[8])
         self.assertEqual(self.run_cli("--once", "-s", "blocked", "-n", "1").stdout.count("asker"), 1)
         self.assertEqual(self.run_cli("--once", "-s", "waiting").stdout.count("asker"), 1)
         self.assertNotIn("writer", self.run_cli("--once", "-s", "waiting").stdout)
@@ -454,7 +505,7 @@ class CliTest(Sandbox):
     def test_long_note_is_cut_at_a_word(self):
         note = "Approve the maintenance window for Saturday night or Sunday morning, whichever has less traffic"
         self.state("b1", state="blocked", name="asker", needs=note)
-        line = self.run_cli("--once").stdout.splitlines()[5]
+        line = next(l for l in self.run_cli("--once").stdout.splitlines() if "asker" in l)
         shown = line[line.index("Approve"):]
         self.assertTrue(len(line) <= 200 and shown.endswith("…"), line)
         self.assertEqual(note[len(shown) - 1], " ")  # the cut is at a word boundary
@@ -479,6 +530,16 @@ class CliTest(Sandbox):
         (self.ct.GUIDES / "sr").write_text("retired\n")
         self.assertNotIn("handed over", self.run_cli("--once").stdout)
         self.assertIn("handed over", self.run_cli("--once", "--retired").stdout)
+
+    def test_once_folds_done_sessions_unless_expanded_or_filtered(self):
+        self.state("fin1", state="done", name="finished one")
+        folded = self.run_cli("--once").stdout
+        self.assertRegex(folded, r"\n ▸ done\s+1 session · last active \d+s ago  ·  finished one\n")
+        self.assertIn("finished one", folded)  # its name, on the section's line
+        self.assertNotIn("fin1", folded)
+        self.assertIn("fin1", self.run_cli("--once", "--expand").stdout)
+        self.assertIn("fin1", self.run_cli("--once", "-s", "done").stdout)
+        self.assertIn("fin1", self.run_cli("--once", "-g", "finished").stdout)
 
     def test_version(self):
         out = self.run_cli("--version")
@@ -549,7 +610,7 @@ class ScreenTest(Sandbox):
         if subprocess.run(probe, capture_output=True).returncode:
             raise unittest.SkipTest("no xterm-256color terminfo")
 
-    def run_screen(self, rows, cols, keys, env=None):
+    def run_screen(self, rows, cols, keys, env=None, argv=()):
         import fcntl
         import pty
         import select
@@ -562,7 +623,7 @@ class ScreenTest(Sandbox):
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
                 os.environ.update(TERM="xterm-256color", PATH=str(self.home / "no-bin"))  # never reach a real `claude`
                 os.environ.update(env or {})
-                os.execv(sys.executable, [sys.executable, str(ROOT / "claude_top.py")])
+                os.execv(sys.executable, [sys.executable, str(ROOT / "claude_top.py"), *argv])
             finally:
                 os._exit(127)
         out = bytearray()
@@ -623,6 +684,18 @@ class ScreenTest(Sandbox):
         self.assertIn("retired guides: 1 hidden (r)", text)
         self.assertIn("shown (r)", text)  # curses repaints only what changed on the line
         self.assertIn("handed over", text)
+
+    def test_enter_and_click_open_and_close_a_section(self):
+        self.state("d1", state="done", name="closedone")
+        click = b"\x1b[M" + bytes([32, 32 + 6, 32 + self.ct.HEADER_ROWS + 1])  # xterm press, column 5, first body line
+        release = b"\x1b[M" + bytes([35, 32 + 6, 32 + self.ct.HEADER_ROWS + 1])
+        text = self.run_screen(24, 160, [b"\n", click + release, b"q"])
+        self.assertIn("\x1b[?1000h", text)  # mouse reporting on
+        first = text.find("▸ done")  # curses repaints only the cells that change: after that, just the arrow
+        opened = text.find("▾", first)
+        self.assertTrue(0 <= first < opened < text.find("▸", opened), (first, opened))
+        self.assertIn("folded: 1", text)
+        self.assertNotIn("\x1b[?1000h", self.run_screen(24, 160, [b"q"], argv=["--no-mouse"]))
 
     def test_tiny_terminal_does_not_crash(self):
         for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing

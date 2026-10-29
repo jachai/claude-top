@@ -12,9 +12,12 @@
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
 o sort, f state filter, / text filter, r show retired guides, +/- refresh speed, space refresh now, ? help,
+sessions sit in sections (needs input, working, review, done, stopped, idle); enter or click on a section's line
+(or right/left) opens and closes it, e opens every section or puts them back,
 q quit, u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
 """
 import argparse
+import collections
 import json
 import math
 import os
@@ -33,7 +36,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -56,9 +59,14 @@ TAIL_BYTES = 512 * 1024
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or 1_000_000)
 SUBAGENT_IDLE_MINUTES = 15
+IDLE_HOURS = float(os.environ.get("CLAUDE_TOP_IDLE_HOURS") or 24)
 
 STATES = ["all", "review", "blocked", "working", "done", "stopped"]
 LIVE_STATES = ("working", "blocked", "review")  # done/stopped sessions keep a stale inFlight snapshot
+GROUPS = ["blocked", "working", "review", "done", "stopped", "idle"]  # one section per group, in this order
+FOLDED = ("review", "done", "stopped", "idle")  # sections that start folded into their one line
+GROUP_LABEL = {"blocked": "needs input", "working": "working", "review": "review", "done": "done", "stopped": "stopped"}
+GUIDE_DONE = re.compile(r"^\W*(done|retired|stood down|closed)\b", re.I)  # a ledger Level that ends a worker
 SORTS = ["last active", "created", "context", "agents", "name"]
 STATE_LABEL = {"review": "review", "blocked": "waiting", "working": "working", "done": "done", "stopped": "stopped"}
 STATE_ALIASES = {"waiting": "blocked"}  # -s takes Claude Code's word or the one the STATE column shows
@@ -68,7 +76,7 @@ LIMITS = [  # rate_limits key, label, window seconds, short key
 ]
 HEADER_ROWS = 4 + len(LIMITS)  # title, agents, one per limit, filter line, column header
 FOOTER_ROWS = 2
-KEYS = " enter attach  c copy  o sort  f state  / filter  +/- speed  ? help  q quit"
+KEYS = " enter attach/open  e all  c copy  o sort  f state  / filter  ? help  q quit"  # +/- is in ? help
 
 _transcript_cache = {}
 _path_cache = {}
@@ -495,8 +503,8 @@ def guide_role(session_ids, name):
 
     "guide" is the active Sessions Manager, "retired" one that handed over to a new guide. The skill keeps a marker
     per session in ~/.claude/session-guide/guides/: the ledger's path for a guide, `retired`, or a worker's state
-    (`guided`, `unguided`, `done` for one the guide closed). Only a path is a guide, so a new worker state never
-    pins its session on top. A session without a marker is told by the skill's default titles instead.
+    (`guided`, `unguided`, `done` for one the guide closed: role "closed"). Only a path is a guide, so a new worker
+    state never pins its session on top. A session without a marker is told by the skill's default titles instead.
     """
     for sid in session_ids:
         if not re.fullmatch(r"[0-9A-Za-z-]+", sid or ""):  # it names a file: no path tricks from state.json
@@ -507,12 +515,64 @@ def guide_role(session_ids, name):
             continue
         if content == "retired":
             return "retired", None
+        if content == "done":
+            return "closed", None
         if "/" in content or content.endswith(".md"):
             return "guide", content
         return None, None
     if RETIRED_TITLE.match(name):
         return "retired", None
     return ("guide" if GUIDE_TITLE.match(name) else None), None
+
+
+_ledger_cache = {}
+
+
+def ledger_done(path):
+    """{id prefix: Level} for the workers a session-guide ledger lists as finished (DONE, RETIRED, ...).
+
+    The ledger's `## Sessions` table names each worker `Title [id6]` in its first cell and its Level in the second.
+    """
+    try:
+        st = os.stat(path)
+        if st.st_size > 2 * 1024 * 1024:
+            return {}
+        cached = _ledger_cache.get(path)
+        if cached and cached[0] == (st.st_size, st.st_mtime):
+            return cached[1]
+        text = Path(path).read_text(errors="replace")
+    except (OSError, ValueError):
+        return {}
+    done, in_sessions = {}, False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            in_sessions = line[3:].strip().lower() == "sessions"
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")] if in_sessions and line.startswith("|") else []
+        if len(cells) < 2:
+            continue
+        ids = re.findall(r"\[([0-9a-f]{6,36})\]", cells[0])
+        if ids and GUIDE_DONE.match(cells[1]):
+            done[ids[-1]] = cells[1]
+    _ledger_cache[path] = ((st.st_size, st.st_mtime), done)
+    return done
+
+
+def apply_guide_done(rows):
+    """A session the session guide has finished with (its `done` marker, or DONE in the active guide's ledger) shows
+    as done rather than waiting on you. One that is working really is, whatever the ledger says, so it stays."""
+    finished = {}
+    for g in rows:
+        if g["guide"] == "guide" and g["ledger"]:
+            finished.update(ledger_done(os.path.expanduser(g["ledger"])))
+    for r in rows:
+        level = "closed by the session guide" if r["guide"] == "closed" else next(
+            (lv for prefix, lv in finished.items() if r["id"].startswith(prefix) or prefix.startswith(r["id"])), None)
+        if level and r["state"] in ("blocked", "review"):
+            r["guide_done"] = level
+            r["state"] = "done"
+            r["note"] = clean(f"session guide: {level}")
+    return rows
 
 
 def live_sessions():
@@ -620,7 +680,7 @@ def load_rows(live_list=None):
             "guide": guide,
             "ledger": clean(ledger or ""),
         })
-    return rows
+    return apply_guide_done(rows)
 
 
 def select(rows, state, text, sort, retired=False):
@@ -642,6 +702,63 @@ def select(rows, state, text, sort, retired=False):
 
 def retired_count(rows):
     return sum(1 for r in rows if r["guide"] == "retired")
+
+
+def default_open(expand=False):
+    return set(GROUPS) if expand else set(GROUPS) - set(FOLDED)
+
+
+def group_of(r, now, idle_hours=IDLE_HOURS):
+    """The section a session sits in, or None for the session guide, which stays on top of them all.
+
+    done and stopped sessions are finished; any other with nothing for idle_hours is idle, whatever its state says.
+    """
+    if r["guide"] == "guide":
+        return None
+    if r["state"] in ("done", "stopped"):
+        return r["state"]
+    if (now - r["last"]).total_seconds() > idle_hours * 3600 or r["state"] not in GROUPS:
+        return "idle"
+    return r["state"]
+
+
+def layout(rows, expanded, now, idle_hours=IDLE_HOURS):
+    """The lines to show: the session guide, then one line per section with its sessions under it when the section
+    is in expanded. rows come from select(), so every section keeps their order."""
+    out, groups = [], {g: [] for g in GROUPS}
+    for r in rows:
+        g = group_of(r, now, idle_hours)
+        (groups[g] if g else out).append(r)
+    for g, members in groups.items():
+        if members:
+            out.append({"id": f"group:{g}", "group": g, "rows": members, "open": g in expanded})
+            if g in expanded:
+                out.extend(members)
+    return out
+
+
+def group_label(group, idle_hours=IDLE_HOURS):
+    if group != "idle":
+        return GROUP_LABEL[group]
+    return f"idle {idle_hours / 24:g}d+" if idle_hours % 24 == 0 else f"idle {idle_hours:g}h+"
+
+
+def group_line(item, now, width, idle_hours=IDLE_HOURS):
+    """A group's one line: open or closed, how many sessions, when the newest was active, and their names."""
+    members = item["rows"]
+    n = len(members)
+    text = (f" {'▾' if item['open'] else '▸'} {group_label(item['group'], idle_hours):<11} {n:>3} session{'' if n == 1 else 's'}"
+            f" · last active {ago(max(r['last'] for r in members), now)} ago")
+    if item["group"] == "idle":
+        states = collections.Counter(STATE_LABEL.get(r["state"], r["state"]) for r in members)
+        text += " (" + ", ".join(f"{c} {s}" for s, c in states.most_common()) + ")"
+    if item["open"]:
+        return fit(text, width)
+    return fit(text + "  ·  " + ", ".join(r["name"] for r in members), width)
+
+
+def folded_count(view):
+    return sum(len(item["rows"]) for item in view if item.get("group") and not item["open"])
 
 
 COLUMNS = [
@@ -714,10 +831,14 @@ def summary(rows):
 
 
 def selected_detail(r):
+    if r.get("group"):
+        return f" {group_label(r['group'])}: " + " · ".join(f"{m['id']} {m['name']}" for m in r["rows"])
     a = r["agents"]
     parts = [f" {r['id']}  {r['cwd']}  session {r['session']}"]
     if r["guide"] == "guide":
         parts.append("session guide" + (f", ledger {r['ledger']}" if r["ledger"] else ""))
+    if r.get("guide_done"):
+        parts.append("done per the session guide; Claude Code still says waiting")
     if a["total"]:
         models = ", ".join(f"{m} {n}" for m, n in sorted(a["models"].items(), key=lambda kv: -kv[1]))
         parts.append(f"subagents {a['total']} ({models})")
@@ -738,8 +859,14 @@ def print_once(args):
     for w in usage.windows(now_s):
         print("".join(text for text, _ in usage_segments(w, now_s))[:width])
     print(plain_line([h for h, _ in COLUMNS]) + "  NOTE")
-    for r in select(rows, args.state, args.grep, "last active", args.retired)[: args.n or None]:
-        print(row_line(row_cells(r, now, args.window), r["note"], width))
+    view = select(rows, args.state, args.grep, "last active", args.retired)
+    if args.state in (None, "all") and not args.grep:  # a filter shows every match
+        view = layout(view, default_open(args.expand), now, args.idle_hours)
+    for r in view[: args.n or None]:
+        if r.get("group"):
+            print(group_line(r, now, width, args.idle_hours))
+        else:
+            print(row_line(row_cells(r, now, args.window), r["note"], width))
 
 
 def row_line(cells, note, width):
@@ -751,7 +878,9 @@ def row_line(cells, note, width):
 
 HELP_KEYS = [
     ("↑ ↓  j k", "move"), ("PgUp PgDn", "page up / down"), ("g  G", "top / bottom"),
-    ("enter", "attach to the session"), ("c", "copy the attach command"), ("o", "next sort order"),
+    ("enter", "attach, or open / close a section"), ("→  ←", "open / close a section"),
+    ("e", "open every section / put back"), ("click", "select; on a section, open / close"),
+    ("c", "copy the attach command"), ("o", "next sort order"),
     ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("r", "show / hide retired guides"),
     ("+  -", "refresh slower / faster"),
     ("space", "refresh now"), ("?", "this help"), ("q  esc", "quit"),
@@ -770,6 +899,12 @@ HELP_COLUMNS = [
     ("NAME  NOTE", "name; its question, result or step"),
     ("", "the session guide is always first"),
 ]
+HELP_GROUPS = [
+    ("▾ needs input", "waiting on you; ▾ working: open"), ("▸ review", "folded: done, worktree open"),
+    ("▸ done", "finished, or done per session-guide"), ("▸ stopped", "stopped sessions"),
+    ("▸ idle 1d+", "anything quiet that long (--idle-hours)"),
+    ("", "a state or text filter shows rows, no sections"),
+]
 
 
 def help_section(title, pairs):
@@ -784,7 +919,7 @@ def help_keys(latest=None):
 def help_lines(cols, latest=None):
     """The help text: keys and usage beside the columns when cols allows, else one after the other."""
     left = help_section("keys", help_keys(latest)) + [""] + help_section("usage", HELP_USAGE)
-    right = help_section("columns", HELP_COLUMNS)
+    right = help_section("columns", HELP_COLUMNS) + [""] + help_section("groups", HELP_GROUPS)
     lw = max(map(len, left))
     if lw + 4 + max(map(len, right)) + 4 <= cols:
         right += [""] * (len(left) - len(right))
@@ -950,6 +1085,10 @@ class Top:
         self.state = args.state or "all"
         self.text = args.grep or ""
         self.retired = args.retired
+        self.expanded = default_open(args.expand)
+        self.idle_hours = args.idle_hours
+        self.mouse = not args.no_mouse
+        self.matched = 0
         self.sort = "last active"
         self.usage = Usage(args.rate_hours)
         self.rows, self.view = [], []
@@ -975,24 +1114,69 @@ class Top:
         self.c_level = {"ok": green, "warn": yellow | curses.A_BOLD, "hot": red | curses.A_BOLD,
                         "dim": curses.A_DIM, "bold": curses.A_BOLD, None: 0}
         self.c_head = cyan | curses.A_BOLD
+        self.c_group = {"blocked": yellow | curses.A_BOLD, "working": green | curses.A_BOLD, "review": cyan | curses.A_BOLD,
+                        "stopped": red | curses.A_BOLD, "idle": curses.A_DIM | curses.A_BOLD}
 
     def body_rows(self):
         return max(1, self.scr.getmaxyx()[0] - HEADER_ROWS - FOOTER_ROWS)
 
     def reload(self, keep=True):
         """Refresh rows; keep the selected session under the cursor unless the view changed."""
-        selected = self.view[self.cursor]["id"] if (keep and self.view) else None
         self.usage.refresh()
         self.rows = load_rows()
-        self.view = select(self.rows, self.state, self.text, self.sort, self.retired)
+        self.relayout(keep)
+        self.last_load = time.monotonic()
+
+    def folding(self):
+        return self.state == "all" and not self.text  # a filter shows every match
+
+    def relayout(self, keep=True, select_id=None):
+        """Rebuild the lines from the loaded rows. The cursor stays on the selected line; when that session has
+        just folded into a closed group, it moves to the group's line."""
+        selected = select_id or (self.view[self.cursor]["id"] if (keep and self.view) else None)
+        rows = select(self.rows, self.state, self.text, self.sort, self.retired)
+        self.matched = len(rows)
+        self.view = layout(rows, self.expanded, datetime.now(timezone.utc), self.idle_hours) if self.folding() else rows
         ids = [r["id"] for r in self.view]
+        holder = next((g["id"] for g in self.view if g.get("group") and selected in [m["id"] for m in g["rows"]]), None)
         if selected in ids:
             self.cursor = ids.index(selected)
+        elif holder:
+            self.cursor = ids.index(holder)
         elif keep:
             self.cursor = min(self.cursor, max(0, len(ids) - 1))
         else:
             self.cursor = self.top = 0
-        self.last_load = time.monotonic()
+
+    def group_at(self, i):
+        """The group line i belongs to: its own for a group's line, else the group line above an opened session."""
+        for item in reversed(self.view[: i + 1]):
+            if item.get("group"):
+                return item["group"]
+        return None
+
+    def set_open(self, group, is_open):
+        if group:
+            self.expanded = self.expanded | {group} if is_open else self.expanded - {group}
+            self.relayout(select_id=f"group:{group}")
+
+    def click(self):
+        """A mouse click selects the line under it, and opens or closes a group's line; the wheel moves."""
+        try:
+            _, _, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if bstate & curses.BUTTON4_PRESSED:
+            self.cursor = max(0, self.cursor - 3)
+        elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+            self.cursor = min(max(0, len(self.view) - 1), self.cursor + 3)
+        elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED) and HEADER_ROWS <= y < HEADER_ROWS + self.body_rows():
+            i = self.top + y - HEADER_ROWS
+            if i < len(self.view):
+                self.cursor = i
+                item = self.view[i]
+                if item.get("group"):
+                    self.set_open(item["group"], not item["open"])
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -1016,7 +1200,10 @@ class Top:
             x = 0
             for text, level in usage_segments(win, now_s):
                 x = self.put(2 + i, x, text, self.c_level.get(level, 0))
-        flt = f" sort: {self.sort}   state: {STATE_LABEL.get(self.state, self.state)}   filter: {self.text or '-'}   showing {len(self.view)}/{len(self.rows)}"
+        flt = f" sort: {self.sort}   state: {STATE_LABEL.get(self.state, self.state)}   filter: {self.text or '-'}   showing {self.matched}/{len(self.rows)}"
+        folded = folded_count(self.view)
+        if folded:
+            flt += f"   folded: {folded} (enter/click a section, e all)"
         retired = retired_count(self.rows)
         if retired:
             flt += f"   retired guides: {'shown' if self.retired else f'{retired} hidden'} (r)"
@@ -1030,8 +1217,13 @@ class Top:
             self.top = self.cursor - body + 1
         for i, r in enumerate(self.view[self.top:self.top + body]):
             y = HEADER_ROWS + i
-            cells = row_cells(r, now, self.window)
             sel = self.top + i == self.cursor
+            if r.get("group"):
+                self.put(y, 0, group_line(r, now, w, self.idle_hours).ljust(w), curses.A_REVERSE if sel else curses.A_BOLD)
+                if not sel:
+                    self.put(y, 3, group_label(r["group"], self.idle_hours), self.c_group.get(r["group"], curses.A_BOLD))
+                continue
+            cells = row_cells(r, now, self.window)
             self.put(y, 0, row_line(cells, r["note"], w).ljust(w), curses.A_REVERSE if sel else 0)
             if sel:
                 continue
@@ -1061,7 +1253,7 @@ class Top:
             self.put(y + i, x, line)
             self.put(y + i, x, "│", self.c_head)
             self.put(y + i, x + len(line) - 1, "│", self.c_head)
-            for m in re.finditer(r"(?:^│ |    )(keys|usage|columns)\b", line):
+            for m in re.finditer(r"(?:^│ |    )(keys|usage|columns|groups)\b", line):
                 self.put(y + i, x + m.start(1), m.group(1), curses.A_BOLD)
 
     def help_key(self, key):
@@ -1106,6 +1298,10 @@ class Top:
         """What to do on leaving: ("quit", None), ("attach", job id) or ("update", (command, version))."""
         curses.curs_set(0)
         self.colors()
+        if self.mouse:
+            curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON4_PRESSED
+                             | getattr(curses, "BUTTON5_PRESSED", 0))
+            curses.mouseinterval(0)  # a press acts at once, without waiting to see if it is a click
         self.reload()
         threading.Thread(target=self.check_update, daemon=True).start()
         self.scr.timeout(200)  # redraw the clock and check the refresh interval 5x a second
@@ -1134,8 +1330,23 @@ class Top:
                 self.cursor = 0
             elif key == ord("G"):
                 self.cursor = last_idx
+            elif key == curses.KEY_MOUSE:
+                self.click()
             elif key in (10, 13, curses.KEY_ENTER) and self.view:
-                return "attach", self.view[self.cursor]["id"]
+                item = self.view[self.cursor]
+                if not item.get("group"):
+                    return "attach", item["id"]
+                self.set_open(item["group"], not item["open"])
+            elif key in (curses.KEY_RIGHT, ord("l")) and self.view:
+                self.set_open(self.view[self.cursor].get("group"), True)
+            elif key in (curses.KEY_LEFT, ord("h")) and self.view:
+                self.set_open(self.group_at(self.cursor), False)
+            elif key == ord("e"):
+                shown = {item["group"] for item in self.view if item.get("group")}
+                self.expanded = default_open() if shown and shown <= self.expanded else set(GROUPS)
+                self.relayout()
+            elif key == ord("c") and self.view and self.view[self.cursor].get("group"):
+                self.message = " a section line: enter or click opens it"
             elif key == ord("c") and self.view:
                 cmd = f"claude attach {self.view[self.cursor]['id']}"
                 self.message = f" copied: {cmd}" if copy_to_clipboard(cmd) else f" {cmd}"
@@ -1326,11 +1537,17 @@ def main():
                     help=f"context window size for the CTX %% column (default {DEFAULT_WINDOW:,} tokens)")
     ap.add_argument("--rate-hours", type=float, default=3.0, help="hours of history behind the 'now' speed (default 3)")
     ap.add_argument("--retired", action="store_true", help="show retired session guides (hidden by default; r toggles)")
+    ap.add_argument("--expand", action="store_true", help="start with every section open (review, done, stopped, idle fold)")
+    ap.add_argument("--idle-hours", type=float, default=IDLE_HOURS,
+                    help=f"fold a session quiet this many hours into the idle group (default {IDLE_HOURS:g})")
+    ap.add_argument("--no-mouse", action="store_true", help="leave the mouse to the terminal (text selection)")
     ap.add_argument("--once", action="store_true", help="print once and exit")
     ap.add_argument("-n", type=int, default=30, help="with --once: rows to print (0 = all)")
     args = ap.parse_args()
     if args.window <= 0:
         ap.error("--window must be a positive number of tokens")
+    if args.idle_hours <= 0:
+        ap.error("--idle-hours must be a positive number of hours")
     args.state = STATE_ALIASES.get(args.state, args.state)
 
     if args.once or not sys.stdout.isatty() or curses is None:
