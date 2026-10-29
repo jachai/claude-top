@@ -687,15 +687,21 @@ class ScreenTest(Sandbox):
 
     def test_enter_and_click_open_and_close_a_section(self):
         self.state("d1", state="done", name="closedone")
-        click = b"\x1b[M" + bytes([32, 32 + 6, 32 + self.ct.HEADER_ROWS + 1])  # xterm press, column 5, first body line
-        release = b"\x1b[M" + bytes([35, 32 + 6, 32 + self.ct.HEADER_ROWS + 1])
-        text = self.run_screen(24, 160, [b"\n", click + release, b"q"])
-        self.assertIn("\x1b[?1000h", text)  # mouse reporting on
+        # a press and release at column 5 of the first body line, in the encoding this terminfo asks for: newer
+        # ncurses turns on SGR mouse mode (1006), older ones the X10 bytes
+        probe = "import curses; curses.setupterm('xterm-256color'); print(b'1006' in (curses.tigetstr('XM') or b''))"
+        y = self.ct.HEADER_ROWS + 1
+        if subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True).stdout.strip() == "True":
+            click = f"\x1b[<0;6;{y}M\x1b[<0;6;{y}m".encode()
+        else:
+            click = b"\x1b[M" + bytes([32, 32 + 6, 32 + y]) + b"\x1b[M" + bytes([35, 32 + 6, 32 + y])
+        text = self.run_screen(24, 160, [b"\n", click, b"q"])
+        self.assertRegex(text, r"\x1b\[\?(1006;)?1000h")  # mouse reporting on
         first = text.find("▸ done")  # curses repaints only the cells that change: after that, just the arrow
         opened = text.find("▾", first)
         self.assertTrue(0 <= first < opened < text.find("▸", opened), (first, opened))
         self.assertIn("folded: 1", text)
-        self.assertNotIn("\x1b[?1000h", self.run_screen(24, 160, [b"q"], argv=["--no-mouse"]))
+        self.assertNotIn("1000h", self.run_screen(24, 160, [b"q"], argv=["--no-mouse"]))
 
     def test_tiny_terminal_does_not_crash(self):
         for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing
