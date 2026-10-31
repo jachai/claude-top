@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-31
+
+### Added
+
+- A legend of session-guide's title colors in the top bar, shown once session-guide has marked a session here.
+- `i` opens how to use claude-top and session-guide, and what each title color means. It is on the bottom bar.
+
+### Changed
+
+- `e` moved off the bottom bar to make room for `i`; it is still in `?` help and on the filter line.
+- A retired guide is also recognized by session-guide's new 🎟️ title, when its marker is missing.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added

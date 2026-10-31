@@ -666,6 +666,28 @@ class ScreenTest(Sandbox):
         self.assertIn("any other key closes", text)
         self.assertIn("this help", text)
 
+    def test_how_to_use_opens_from_the_bottom_bar_and_explains_the_colors(self):
+        self.assertLessEqual(len(self.ct.KEYS), 79)
+        self.assertIn("i how-to", self.ct.KEYS)
+        text = self.run_screen(40, 100, [b"i", b"x", b"q"])
+        for line in ("how to use", "/session-guide join", "neither managed nor watched", "any key closes"):
+            self.assertIn(line, text)
+
+    def test_help_box_keeps_its_border_straight_with_wide_emoji(self):
+        _, _, box, _ = self.ct.help_box(self.ct.HOW_TO_USE, 40, 100)
+        self.assertEqual({self.ct.display_width(line) for line in box}, {self.ct.display_width(box[0])})
+
+    def test_legend_shows_only_once_session_guide_has_been_used(self):
+        self.assertFalse(self.ct.legend_shown())
+        self.assertNotIn("manager", self.run_screen(24, 120, [b"q"]))
+        self.ct.GUIDES.mkdir(parents=True)
+        (self.ct.GUIDES / "abc").write_text("guided")
+        self.assertTrue(self.ct.legend_shown())
+        text = self.run_screen(24, 120, [b"q"])
+        for word in ("manager", "retired", "guided", "watched", "active", "closed"):
+            self.assertIn(word, text)
+        self.assertIn("manager", self.run_screen(24, 80, [b"q"]))  # its own row: it fits a small terminal
+
     def test_cached_newer_release_is_offered_and_n_declines(self):
         self.ct.DATA_DIR.mkdir(parents=True)
         self.ct.UPDATE_CHECK.write_text(json.dumps({"checked": int(self.now), "latest": "9.9.9"}))

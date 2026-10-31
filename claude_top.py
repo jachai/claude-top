@@ -12,6 +12,7 @@
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
 o sort, f state filter, / text filter, r show retired guides, +/- refresh speed, space refresh now, ? help,
+i how to use,
 sessions sit in sections (needs input, working, review, done, stopped, idle); enter or click on a section's line
 (or right/left) opens and closes it, e opens every section or puts them back,
 q quit, u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +38,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -52,7 +54,7 @@ RELEASES_URL = "https://github.com/jachai/claude-top/releases/latest"
 PACKAGE = "claude-agents-top"
 GUIDES = CLAUDE_DIR / "session-guide" / "guides"  # session-guide's marker per session: a ledger path, retired or guided
 GUIDE_TITLE = re.compile("^\U0001f7e5\U0001f7e5 Sessions Manager")  # session-guide's default titles, for a missing marker
-RETIRED_TITLE = re.compile("^\U0001f7e9\U0001f7e9 Sessions Manager \\(retired\\)")
+RETIRED_TITLE = re.compile("^(?:\U0001f7e9\U0001f7e9|\U0001f39f\ufe0f\U0001f39f\ufe0f) Sessions Manager \\(retired\\)")
 DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "plan-usage-history.json"
 
 TAIL_BYTES = 512 * 1024
@@ -76,7 +78,36 @@ LIMITS = [  # rate_limits key, label, window seconds, short key
 ]
 HEADER_ROWS = 4 + len(LIMITS)  # title, agents, one per limit, filter line, column header
 FOOTER_ROWS = 2
-KEYS = " enter attach/open  e all  c copy  o sort  f state  / filter  ? help  q quit"  # +/- is in ? help
+KEYS = " enter attach/open  c copy  o sort  f state  / filter  ? help  i how-to  q quit"  # e, +/- are in ? help
+LEGEND = (" \U0001f7e5 manager  \U0001f39f\ufe0f retired  \U0001f7e7 guided  \u2b1c watched  \U0001f7e6 active"
+          "  \u2705 closed ")  # session-guide's title colors; shown once it has been used here
+HOW_TO_USE = [
+    "how to use",
+    "  Each row is a Claude Code session. Press enter to open one, c to copy",
+    "  the command that opens it. Sessions waiting on you come first.",
+    "",
+    "  Keep an eye on the state: needs input means a session is stuck until",
+    "  you answer it. Open and close a section with enter, or all with e.",
+    "  Narrow the list with f (state) and / (text), and sort it with o.",
+    "",
+    "with session-guide",
+    "  /session-guide                 make this session the manager",
+    "  /session-guide join            opt a session in as guided",
+    "  /session-guide leave           opt it back out",
+    "  /session-guide handoff         hand over to a new manager",
+    "  Take over as guide. Ledger: <path>   (after /session-guide)",
+    "",
+    "the title colors",
+    "  \U0001f7e5 manager   the one active Sessions Manager, always the first row",
+    "  \U0001f39f\ufe0f retired   a manager that handed over; r shows or hides them",
+    "  \U0001f7e7 guided    (g) managed: it reports to the manager, not to you",
+    "  \u2b1c watched   the manager reads it and passes on its questions",
+    "  \U0001f7e6 active    running, but neither managed nor watched",
+    "  \u2705 closed    finished; the manager closed it",
+    "",
+    "  The manager interviews you about new sessions, decisions and approvals.",
+    "  A title changes on that session's next prompt.",
+]
 
 _transcript_cache = {}
 _path_cache = {}
@@ -883,7 +914,7 @@ HELP_KEYS = [
     ("c", "copy the attach command"), ("o", "next sort order"),
     ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("r", "show / hide retired guides"),
     ("+  -", "refresh slower / faster"),
-    ("space", "refresh now"), ("?", "this help"), ("q  esc", "quit"),
+    ("space", "refresh now"), ("?", "this help"), ("i", "how to use, and the title colors"), ("q  esc", "quit"),
 ]
 HELP_USAGE = [
     ("5h  week", "plan used; │ marks time elapsed"), ("1.0x", "speed: lands on 100% at reset"),
@@ -929,7 +960,7 @@ def help_lines(cols, latest=None):
 
 def help_box(lines, rows, cols, offset=0):
     """The help overlay on a rows x cols screen: (y, x, box lines, offset), centered and scrolled to offset."""
-    width, height = min(max(map(len, lines)) + 4, cols), min(len(lines) + 2, rows)
+    width, height = min(max(map(display_width, lines)) + 4, cols), min(len(lines) + 2, rows)
     inner_w, inner_h = width - 4, height - 2
     if inner_w < 1 or inner_h < 1:
         return 0, 0, [], 0
@@ -937,7 +968,8 @@ def help_box(lines, rows, cols, offset=0):
     more = len(lines) > inner_h
     label = "↑↓ scroll · any other key closes" if more else "any key closes"
     box = [edge("┌", "help", "┐", width)]
-    box += ["│ " + line[:inner_w].ljust(inner_w) + " │" for line in lines[offset:offset + inner_h]]
+    box += ["│ " + line[:inner_w] + " " * max(0, inner_w - display_width(line[:inner_w])) + " │"
+            for line in lines[offset:offset + inner_h]]
     box.append(edge("└", label, "┘", width))
     return (rows - height) // 2, (cols - width) // 2, box, offset
 
@@ -1032,6 +1064,20 @@ def update_hint(latest):
     return f" u update to {latest} "
 
 
+def display_width(text):
+    """Terminal cells for text: wide emoji take two, a variation selector none."""
+    return sum(0 if c == "\ufe0f" else 2 if unicodedata.east_asian_width(c) in "WF" or c == "\U0001f39f" else 1
+               for c in text)
+
+
+def legend_shown():
+    """True once session-guide has marked a session here: the legend means nothing to anyone else."""
+    try:
+        return any(GUIDES.iterdir())
+    except OSError:
+        return False
+
+
 def footer_keys(latest):
     return (update_hint(latest) if latest else "") + KEYS
 
@@ -1095,6 +1141,7 @@ class Top:
         self.cursor = self.top = 0
         self.message = ""
         self.help = None  # scroll offset while the help overlay is open
+        self.help_page = None  # the lines the overlay shows; None is the ? help
         self.last_load = 0.0
         self.latest = None  # a newer release, once the background check finds one
 
@@ -1118,7 +1165,7 @@ class Top:
                         "stopped": red | curses.A_BOLD, "idle": curses.A_DIM | curses.A_BOLD}
 
     def body_rows(self):
-        return max(1, self.scr.getmaxyx()[0] - HEADER_ROWS - FOOTER_ROWS)
+        return max(1, self.scr.getmaxyx()[0] - self.header_rows - FOOTER_ROWS)
 
     def reload(self, keep=True):
         """Refresh rows; keep the selected session under the cursor unless the view changed."""
@@ -1170,13 +1217,17 @@ class Top:
             self.cursor = max(0, self.cursor - 3)
         elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
             self.cursor = min(max(0, len(self.view) - 1), self.cursor + 3)
-        elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED) and HEADER_ROWS <= y < HEADER_ROWS + self.body_rows():
-            i = self.top + y - HEADER_ROWS
+        elif bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED) and self.header_rows <= y < self.header_rows + self.body_rows():
+            i = self.top + y - self.header_rows
             if i < len(self.view):
                 self.cursor = i
                 item = self.view[i]
                 if item.get("group"):
                     self.set_open(item["group"], not item["open"])
+
+    @property
+    def header_rows(self):
+        return HEADER_ROWS + legend_shown()
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -1195,11 +1246,14 @@ class Top:
         head = f" claude-top {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
         self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
         self.put(1, 0, f" {agents}".ljust(w), curses.A_REVERSE)
+        legend = self.header_rows - HEADER_ROWS
+        if legend:
+            self.put(2, 0, LEGEND.ljust(w), curses.A_REVERSE)
         now_s = time.time()
         for i, win in enumerate(self.usage.windows(now_s)):
             x = 0
             for text, level in usage_segments(win, now_s):
-                x = self.put(2 + i, x, text, self.c_level.get(level, 0))
+                x = self.put(2 + legend + i, x, text, self.c_level.get(level, 0))
         flt = f" sort: {self.sort}   state: {STATE_LABEL.get(self.state, self.state)}   filter: {self.text or '-'}   showing {self.matched}/{len(self.rows)}"
         folded = folded_count(self.view)
         if folded:
@@ -1207,8 +1261,8 @@ class Top:
         retired = retired_count(self.rows)
         if retired:
             flt += f"   retired guides: {'shown' if self.retired else f'{retired} hidden'} (r)"
-        self.put(HEADER_ROWS - 2, 0, flt, curses.A_DIM)
-        self.put(HEADER_ROWS - 1, 0, plain_line([hd for hd, _ in COLUMNS]) + "  NOTE", self.c_head)
+        self.put(self.header_rows - 2, 0, flt, curses.A_DIM)
+        self.put(self.header_rows - 1, 0, plain_line([hd for hd, _ in COLUMNS]) + "  NOTE", self.c_head)
 
         body = self.body_rows()
         if self.cursor < self.top:
@@ -1216,7 +1270,7 @@ class Top:
         elif self.cursor >= self.top + body:
             self.top = self.cursor - body + 1
         for i, r in enumerate(self.view[self.top:self.top + body]):
-            y = HEADER_ROWS + i
+            y = self.header_rows + i
             sel = self.top + i == self.cursor
             if r.get("group"):
                 self.put(y, 0, group_line(r, now, w, self.idle_hours).ljust(w), curses.A_REVERSE if sel else curses.A_BOLD)
@@ -1245,15 +1299,16 @@ class Top:
 
     def draw_help(self):
         h, w = self.scr.getmaxyx()
-        y, x, box, self.help = help_box(help_lines(w, self.latest), h, w, self.help)
+        y, x, box, self.help = help_box(self.help_page or help_lines(w, self.latest), h, w, self.help)
         for i, line in enumerate(box):
             if i in (0, len(box) - 1):
                 self.put(y + i, x, line, self.c_head)
                 continue
             self.put(y + i, x, line)
             self.put(y + i, x, "│", self.c_head)
-            self.put(y + i, x + len(line) - 1, "│", self.c_head)
-            for m in re.finditer(r"(?:^│ |    )(keys|usage|columns|groups)\b", line):
+            self.put(y + i, x + display_width(line) - 1, "│", self.c_head)
+            for m in re.finditer(r"(?:^│ |    )(keys|usage|columns|groups|how to use|with session-guide|the title colors)\b",
+                                 line):
                 self.put(y + i, x + m.start(1), m.group(1), curses.A_BOLD)
 
     def help_key(self, key):
@@ -1369,6 +1424,10 @@ class Top:
             elif key == ord(" "):
                 self.reload()
             elif key == ord("?"):
+                self.help_page = None
+                self.help = 0
+            elif key == ord("i"):
+                self.help_page = HOW_TO_USE
                 self.help = 0
             elif key == ord("u") and self.latest:
                 cmd = update_command()
