@@ -16,6 +16,15 @@ i how to use,
 sessions sit in sections (needs input, working, review, done, stopped, idle); enter or click on a section's line
 (or right/left) opens and closes it, e opens every section or puts them back,
 q quit, u update (shown when a newer release is out; CLAUDE_TOP_NO_UPDATE_CHECK=1 turns the daily check off).
+
+Session titles (session-guide's markings; a title changes on that session's next prompt, but a finished one
+always shows as closed here):
+  🟥🟥 the active Sessions Manager (guide), always the first row
+  🎟️🎟️ a retired guide (handed over; r shows or hides them)
+  🟧🟧 (g) managed: still in play, it reports to the guide
+  ⬜⬜ watched: the guide reads it and passes on its questions
+  🟦🟦 active: running, neither managed nor watched
+  ✅ finished: the guide closed it, or its ledger row is DONE
 """
 import argparse
 import collections
@@ -38,7 +47,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -589,6 +598,18 @@ def ledger_done(path):
     return done
 
 
+WORKER_MARK = re.compile("^(?:\U0001f7e7\U0001f7e7 \\(g\\)|\\(g\\)|\u2b1c\u2b1c|\U0001f7e6\U0001f7e6|\u2705)\\s*")
+
+
+def closed_name(name):
+    """`name` as session-guide shows a finished session: a single "\u2705 " in place of any orange, gray or blue
+    worker prefix. Only the display changes; the guide reads its own markers and ledger."""
+    bare = name
+    while WORKER_MARK.match(bare):
+        bare = WORKER_MARK.sub("", bare, count=1)
+    return f"\u2705 {bare}" if bare else name
+
+
 def apply_guide_done(rows):
     """A session the session guide has finished with (its `done` marker, or DONE in the active guide's ledger) shows
     as done rather than waiting on you. One that is working really is, whatever the ledger says, so it stays."""
@@ -603,6 +624,10 @@ def apply_guide_done(rows):
             r["guide_done"] = level
             r["state"] = "done"
             r["note"] = clean(f"session guide: {level}")
+        # finished = the guide closed it (marker) or its ledger row is DONE, and it is not working now. A job that
+        # merely reads done, or is waiting for its guide, is not: it keeps whatever prefix its title has.
+        if level and r["state"] != "working" and r["guide"] not in ("guide", "retired") and not level.lower().lstrip("\W").startswith("retired"):
+            r["name"] = closed_name(r["name"])
     return rows
 
 

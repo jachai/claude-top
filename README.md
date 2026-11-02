@@ -64,6 +64,17 @@ Sessions sit in sections, like Claude Code's own agents view: **needs input** an
 
 The top bar shows a legend of its title colors, once you have used it here: 🟥 manager, 🎟️ retired, 🟧 guided, ⬜ watched, 🟦 active, ✅ closed. Press `i` for what each means and how to use the guide.
 
+| Title starts with | Means |
+|---|---|
+| 🟥🟥 | the active guide (Sessions Manager), always the first row |
+| 🎟️🎟️ | a retired guide, one that handed over (hidden; `r` shows it) |
+| 🟧🟧 (g) | managed: still in play, reports to the guide |
+| ⬜⬜ | watched: the guide reads it and passes on its questions |
+| 🟦🟦 | active: running, neither managed nor watched |
+| ✅ | finished: the guide closed it, or its ledger row is DONE |
+
+A title is changed by session-guide on that session's next prompt, which a finished session never gets, so claude-top shows `✅` itself for a session whose marker says closed or whose ledger row is DONE. It changes only the display.
+
 If you run [session-guide](https://github.com/jachai/session-guide), claude-top knows its sessions: the active guide (🟥🟥 Sessions Manager) is always on top, and guides that handed over (🎟️🎟️ retired) are hidden. Press `r` or pass `--retired` to see them. It reads the skill's markers in `~/.claude/session-guide/guides/`, and falls back to its default titles.
 
 A worker the guide has finished with shows as **done**, not waiting on you, even while Claude Code still lists it under needs input: either its marker says `done`, or the active guide's ledger lists it in the `## Sessions` table with a Level of DONE, RETIRED, STOOD DOWN or CLOSED. A worker that is actually working stays in working.

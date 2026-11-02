@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
+### Fixed
+
+- A finished session no longer shows as managed. A session whose session-guide marker says closed, or whose
+  ledger row in the active guide's ledger is DONE (and that is not working), shows as `✅ <title>` in place of
+  "🟧🟧 (g)", gray or blue blocks, in the list, the section lines and the detail. Only the display changes; the
+  guide reads its own markers and ledger. A session that merely reads done (say, waiting for its guide) keeps its
+  title as it is.
+
+### Added
+
+- The title markings (🟥🟥 guide, 🎟️🎟️ retired, 🟧🟧 (g) managed, ⬜⬜ watched, 🟦🟦 active, ✅ finished) in
+  `claude-top --help` and the README.
+
 ## [0.6.0] - 2026-10-31
 
 ### Added

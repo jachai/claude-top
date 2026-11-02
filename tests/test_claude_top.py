@@ -467,6 +467,34 @@ class RowsTest(Sandbox):
         self.assertIn("done per the session guide", self.ct.selected_detail(rows["ffffff11"]))
         self.assertEqual(self.ct.ledger_done(str(self.home / "missing.md")), {})
 
+    def test_a_finished_session_shows_the_check_mark_not_the_orange_prefix(self):
+        ledger = self.home / "ledger.md"
+        ledger.write_text("\n".join([
+            "## Sessions", "| Title [id6] | Level | Role |", "|---|---|---|",
+            "| (g) ledger done [aaaaaa] | DONE 12:00 | x |", "| (g) waiting [bbbbbb] | MANAGED | x |",
+            "| (g) busy [dddddd] | DONE 12:00 | x |", ""]))
+        self.state("guide1", state="working", name="guide", sessionId="sg")
+        self.guide_marker("sg", str(ledger))
+        orange = "\U0001f7e7\U0001f7e7 (g) "
+        self.state("aaaaaa11", state="done", name=orange + "ledger done \u00b7 focus")
+        self.state("bbbbbb11", state="done", name=orange + "waiting for its guide")  # state done, not closed
+        self.state("dddddd11", state="working", name=orange + "busy")
+        self.state("closed1", state="stopped", name="\u2b1c\u2b1c " + orange + "marker closed", sessionId="sc")
+        self.guide_marker("sc", "done")
+        self.state("already", state="done", name="\u2705 marker closed", sessionId="sx")
+        self.guide_marker("sx", "done")
+        rows = self.rows()
+        names = {i: r["name"] for i, r in rows.items()}
+        self.assertEqual(names["aaaaaa11"], "\u2705 ledger done \u00b7 focus")
+        self.assertEqual(names["bbbbbb11"], orange + "waiting for its guide")
+        self.assertEqual(names["dddddd11"], orange + "busy")
+        self.assertEqual(names["closed1"], "\u2705 marker closed")
+        self.assertEqual(names["already"], "\u2705 marker closed")
+        self.assertEqual(names["guide1"], "guide")
+        self.assertEqual(self.ct.closed_name("\U0001f7e6\U0001f7e6 x"), "\u2705 x")
+        self.assertIn("Session titles", self.ct.__doc__)
+        self.assertIn("\u2705", self.ct.__doc__)
+
     def test_summary_lines(self):
         sid = self.working_session()
         self.subagent(sid, "fresh", finished=False)
