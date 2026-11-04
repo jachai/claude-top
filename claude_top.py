@@ -626,7 +626,7 @@ def apply_guide_done(rows):
             r["note"] = clean(f"session guide: {level}")
         # finished = the guide closed it (marker) or its ledger row is DONE, and it is not working now. A job that
         # merely reads done, or is waiting for its guide, is not: it keeps whatever prefix its title has.
-        if level and r["state"] != "working" and r["guide"] not in ("guide", "retired") and not level.lower().lstrip("\W").startswith("retired"):
+        if level and r["state"] != "working" and r["guide"] not in ("guide", "retired") and not re.match(r"\W*retired\b", level, re.I):
             r["name"] = closed_name(r["name"])
     return rows
 

@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- A guide whose ledger row reads RETIRED behind markdown or an emoji (`**RETIRED**`, `🎟️ RETIRED`) keeps its title
+  instead of getting the finished check mark. The check stripped a literal `\W` instead of leading punctuation, and
+  newer Pythons warned about it (SyntaxWarning: invalid escape sequence).
+
 ## [0.6.2] - 2026-11-04
 
 ### Changed
