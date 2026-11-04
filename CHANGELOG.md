@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Codex sessions and multi-agent trees: `codex-top` (or `claude-top --runtime codex`) reads Codex's local state
+  database in read-only mode, shows one row per top-level thread, counts nested spawned/running agents, lists active
+  canonical agent paths in the detail, and derives working / needs-input / done from rollout task lifecycle events.
+- Enter resumes a Codex thread with `codex resume <id>`; `c` copies that command. The existing Claude behavior and
+  `claude-top` default remain unchanged.
+
+### Changed
+
+- Codex mode explicitly marks plan-limit rows unavailable instead of displaying recorded Claude plan usage.
+
 ### Fixed
 
 - A guide whose ledger row reads RETIRED behind markdown or an emoji (`**RETIRED**`, `🎟️ RETIRED`) keeps its title

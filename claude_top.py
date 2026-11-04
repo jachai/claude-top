@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""claude-top: a live, top-style view of your Claude Code background sessions and plan usage.
+"""claude-top: a live, top-style view of Claude Code or Codex sessions and agents.
 
   claude-top                  full screen, refreshes every 2s
   claude-top -i 5             refresh every 5s
   claude-top -s waiting       start filtered to sessions waiting for input (or -s blocked)
   claude-top -g billing       start with a text filter
   claude-top --once           print once and exit
+  claude-top --runtime codex  show Codex threads and their multi-agent trees
+  codex-top                   the same Codex view (installed with this package)
   claude-top init             set claude-top as your Claude Code status line (--wrap keeps an existing one)
   claude-top statusline       status-line command: records plan limits, prints a short usage line
   claude-top record           same, but prints nothing (pipe your own status line's input into it)
@@ -34,6 +36,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -50,6 +53,7 @@ except ImportError:  # Windows: only --once works
 __version__ = "0.6.2"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+CODEX_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 JOBS = CLAUDE_DIR / "jobs"
 PROJECTS = CLAUDE_DIR / "projects"
 DATA_DIR = CLAUDE_DIR / "claude-top"
@@ -65,6 +69,7 @@ GUIDES = CLAUDE_DIR / "session-guide" / "guides"  # session-guide's marker per s
 GUIDE_TITLE = re.compile("^\U0001f7e5\U0001f7e5 Sessions Manager")  # session-guide's default titles, for a missing marker
 RETIRED_TITLE = re.compile("^(?:\U0001f7e9\U0001f7e9|\U0001f39f\ufe0f\U0001f39f\ufe0f) Sessions Manager \\(retired\\)")
 DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "plan-usage-history.json"
+CODEX_STATE_DB = os.environ.get("CLAUDE_TOP_CODEX_STATE_DB")
 
 TAIL_BYTES = 512 * 1024
 MAX_TAIL_BYTES = 2 * 1024 * 1024
@@ -81,6 +86,7 @@ GUIDE_DONE = re.compile(r"^\W*(done|retired|stood down|closed)\b", re.I)  # a le
 SORTS = ["last active", "created", "context", "agents", "name"]
 STATE_LABEL = {"review": "review", "blocked": "waiting", "working": "working", "done": "done", "stopped": "stopped"}
 STATE_ALIASES = {"waiting": "blocked"}  # -s takes Claude Code's word or the one the STATE column shows
+RUNTIMES = ("claude", "codex")
 LIMITS = [  # rate_limits key, label, window seconds, short key
     ("five_hour", "5h", 5 * 3600, "fh"),
     ("seven_day", "week", 7 * 86400, "sd"),
@@ -116,6 +122,24 @@ HOW_TO_USE = [
     "",
     "  The manager interviews you about new sessions, decisions and approvals.",
     "  A title changes on that session's next prompt.",
+]
+HOW_TO_USE_CODEX = [
+    "how to use",
+    "  Each row is one top-level Codex thread. Press enter to resume it,",
+    "  or c to copy the codex resume command. Active threads come first.",
+    "",
+    "  RUN and SPAWNED summarize the whole multi-agent tree below that root.",
+    "  Select a row to see active agents by canonical /root/... path.",
+    "  State comes from task lifecycle records in the local rollout; an open",
+    "  structured user-input request is needs input. Finished turns are done.",
+    "",
+    "with session-guide",
+    "  Ask the root thread to use session-guide for its current agent tree.",
+    "  Codex guide levels live in its ledger; Codex has no Claude title hooks.",
+    "  The guide routes decisions, owns loose ends, and reports agent results.",
+    "",
+    "  This view is read-only. It reads Codex local state and rollout files;",
+    "  it does not discover remote or unrelated app-server instances.",
 ]
 
 _transcript_cache = {}
@@ -356,6 +380,8 @@ def pace_level(pace):
 
 def usage_segments(w, now):
     """One header line per limit, as [(text, color level)]."""
+    if w.get("unavailable"):
+        return [(f" {w['label']:<5}", "bold"), ("Codex plan usage is not exposed in local session state", "dim")]
     if w["used"] is None:
         return [(f" {w['label']:<5}", "bold"), ("no data yet: run `claude-top init` to record your plan limits", "dim")]
     level = pace_level(w["pace"])
@@ -389,6 +415,15 @@ def statusline_text(usage, now):
             text += " → out " + datetime.fromtimestamp(w["runs_out"]).strftime("%a %H:%M")
         parts.append(text)
     return " · ".join(parts)
+
+
+class UnavailableUsage:
+    """Stable header rows for Codex without presenting Claude plan limits as Codex usage."""
+    def refresh(self):
+        pass
+
+    def windows(self, now):
+        return [{"label": label, "unavailable": True} for _, label, _, _ in LIMITS]
 
 
 # ---------------------------------------------------------------- sessions
@@ -678,7 +713,217 @@ def in_flight(state, agents):
     return agents, background, bg_kinds
 
 
-def load_rows(live_list=None):
+_codex_transcript_cache = {}
+
+
+def codex_state_path():
+    """Newest Codex state database, or the explicit test/override path. None when Codex has no local state."""
+    if CODEX_STATE_DB:
+        return Path(CODEX_STATE_DB)
+    hits = list(CODEX_DIR.glob("state_*.sqlite"))
+    if not hits:
+        return None
+    def key(path):
+        found = re.search(r"_(\d+)\.sqlite$", path.name)
+        return (int(found.group(1)) if found else -1, path.stat().st_mtime)
+    try:
+        return max(hits, key=key)
+    except OSError:
+        return None
+
+
+def codex_state():
+    """(threads, spawn edges) from Codex's read-only local state; empty on an older or unavailable schema."""
+    path = codex_state_path()
+    if not path or not path.is_file():
+        return [], []
+    try:
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
+        try:
+            db.row_factory = sqlite3.Row
+            threads = [dict(row) for row in db.execute(
+                "SELECT id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms, cwd, title, name, "
+                "preview, model, reasoning_effort, agent_path, agent_nickname, thread_source, archived "
+                "FROM threads WHERE archived = 0")]
+            edges = [dict(row) for row in db.execute(
+                "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges")]
+        finally:
+            db.close()
+        return threads, edges
+    except (OSError, sqlite3.Error):
+        return [], []
+
+
+def codex_text(content):
+    return " ".join(str(p.get("text") or "") for p in content or []
+                    if isinstance(p, dict) and p.get("type") in ("output_text", "input_text")).strip()
+
+
+def codex_rollout_info(path):
+    """Model, effort, context, activity and task state from one local Codex rollout, read-only and fail-open."""
+    info = {"model": None, "effort": None, "ctx": None, "activity": None, "last_ts": None, "state": "done"}
+    if not path:
+        return info
+    try:
+        st = os.stat(path)
+    except OSError:
+        return info
+    cached = _codex_transcript_cache.get(path)
+    if cached and cached[0] == (st.st_size, st.st_mtime):
+        return cached[1]
+    pending, saw_lifecycle = set(), False
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, st.st_size - MAX_TAIL_BYTES))
+            lines = fh.read().splitlines()
+        if st.st_size > MAX_TAIL_BYTES:
+            lines = lines[1:]
+        for raw in lines:
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            timestamp = parse_ts(event.get("timestamp"))
+            if timestamp:
+                info["last_ts"] = timestamp
+            kind = event.get("type")
+            if kind == "turn_context":
+                info["model"] = payload.get("model") or info["model"]
+                info["effort"] = payload.get("effort") or info["effort"]
+            elif kind == "token_usage_record":
+                usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+                info["ctx"] = usage.get("input_tokens") or info["ctx"]
+            elif kind == "event_msg" and payload.get("type") == "task_started":
+                saw_lifecycle = True
+                info["state"] = "working"
+                pending.clear()
+            elif kind == "event_msg" and payload.get("type") == "task_complete":
+                saw_lifecycle = True
+                info["state"] = "done"
+                pending.clear()
+            elif kind == "response_item":
+                item_type = payload.get("type")
+                if item_type == "message" and payload.get("role") == "assistant":
+                    text = codex_text(payload.get("content"))
+                    if text:
+                        info["activity"] = text.splitlines()[0][:200]
+                elif item_type in ("function_call", "custom_tool_call"):
+                    call_id = payload.get("call_id")
+                    if payload.get("name") == "request_user_input" and call_id:
+                        pending.add(call_id)
+                    info["activity"] = clean(payload.get("name") or "tool")[:200]
+                elif item_type in ("function_call_output", "custom_tool_call_output"):
+                    pending.discard(payload.get("call_id"))
+        # A long, still-running turn has its task_started near the beginning and no task_complete at the tail. Only
+        # that case needs a full linear pass; completed turns carry task_complete in the tail, so old sessions stay cheap.
+        if not saw_lifecycle and st.st_size > MAX_TAIL_BYTES:
+            with open(path, "rb") as fh:
+                for raw in fh:
+                    if b'"task_started"' not in raw and b'"task_complete"' not in raw:
+                        continue
+                    try:
+                        payload = (json.loads(raw).get("payload") or {})
+                    except (ValueError, AttributeError):
+                        continue
+                    if payload.get("type") == "task_started":
+                        info["state"] = "working"
+                    elif payload.get("type") == "task_complete":
+                        info["state"] = "done"
+        if pending:
+            info["state"] = "blocked"
+    except OSError:
+        return info
+    _codex_transcript_cache[path] = ((st.st_size, st.st_mtime), info)
+    return info
+
+
+def epoch(row, millisecond, second):
+    value = row.get(millisecond)
+    if value:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    value = row.get(second)
+    return datetime.fromtimestamp(value, tz=timezone.utc) if value else None
+
+
+def codex_rows():
+    """One row per top-level Codex thread, with its whole spawned-agent tree summarized in RUN/SPAWNED."""
+    threads, edges = codex_state()
+    if not threads:
+        return []
+    by_id = {row["id"]: row for row in threads}
+    children = collections.defaultdict(list)
+    edge_status = {}
+    for edge in edges:
+        parent, child = edge.get("parent_thread_id"), edge.get("child_thread_id")
+        if parent and child in by_id:
+            children[parent].append(child)
+            edge_status[child] = edge.get("status") or ""
+    child_ids = set(edge_status)
+    ignored = {"guardian_review", "realtime_voice", "subagent"}
+    roots = [row for row in threads if row["id"] not in child_ids and row.get("thread_source") not in ignored]
+    infos = {}
+    def rollout(thread_id):
+        if thread_id not in infos:
+            infos[thread_id] = codex_rollout_info(by_id[thread_id].get("rollout_path"))
+        return infos[thread_id]
+    def descendants(thread_id):
+        found, stack = [], list(children.get(thread_id, ()))
+        while stack:
+            child = stack.pop()
+            if child in found:
+                continue
+            found.append(child)
+            stack.extend(children.get(child, ()))
+        return found
+    rows = []
+    for root in roots:
+        info = rollout(root["id"])
+        agents = descendants(root["id"])
+        active = [sid for sid in agents if edge_status.get(sid) != "closed" and rollout(sid)["state"] != "done"]
+        models = collections.Counter(clean(by_id[sid].get("model") or rollout(sid)["model"] or "inherit")
+                                     for sid in agents)
+        active_names = [clean(by_id[sid].get("agent_path") or by_id[sid].get("agent_nickname") or sid[:8])
+                        for sid in active]
+        state = "working" if active and info["state"] == "done" else info["state"]
+        created = epoch(root, "created_at_ms", "created_at")
+        updated = epoch(root, "updated_at_ms", "updated_at")
+        last = max(filter(None, (info["last_ts"], updated)), default=created)
+        if not last:
+            continue
+        name = clean(root.get("name") or root.get("title") or root.get("preview") or root["id"])
+        note = clean(info["activity"] or root.get("preview") or "")
+        if active_names:
+            note = "agents: " + "; ".join(active_names[:3]) + (f"; +{len(active_names) - 3}" if len(active_names) > 3 else "")
+        rows.append({
+            "id": clean(root["id"]),
+            "kind": "codex",
+            "runtime": "codex",
+            "state": state,
+            "name": name,
+            "note": note,
+            "search": " ".join([name, note, clean(root.get("cwd") or "")] + active_names).lower(),
+            "cwd": clean(root.get("cwd") or ""),
+            "session": clean(root["id"]),
+            "last": last,
+            "created": created or last,
+            "model": root.get("model") or info["model"],
+            "effort": root.get("reasoning_effort") or info["effort"],
+            "ctx": info["ctx"],
+            "agents": {"total": len(agents), "running": len(active), "models": dict(models), "active": active_names},
+            "bg": 0,
+            "bg_kinds": [],
+            "guide": None,
+            "ledger": "",
+        })
+    return rows
+
+
+def load_rows(live_list=None, runtime="claude"):
+    if runtime == "codex":
+        return codex_rows()
     rows = []
     if live_list is None:
         live_list = live_sessions()
@@ -719,6 +964,7 @@ def load_rows(live_list=None):
         rows.append({
             "id": clean(job_id),
             "kind": live_entry.get("kind") or "background",
+            "runtime": "claude",
             "state": state.get("state") or "?",
             "name": name,
             "note": clean(note),
@@ -908,9 +1154,9 @@ def selected_detail(r):
 def print_once(args):
     now, now_s = datetime.now(timezone.utc), time.time()
     width = shutil.get_terminal_size((200, 20)).columns
-    usage = Usage(args.rate_hours)
+    usage = UnavailableUsage() if args.runtime == "codex" else Usage(args.rate_hours)
     usage.refresh()
-    rows = load_rows()
+    rows = load_rows(runtime=args.runtime)
     print("\n".join(summary(rows)))
     for w in usage.windows(now_s):
         print("".join(text for text, _ in usage_segments(w, now_s))[:width])
@@ -948,7 +1194,7 @@ HELP_USAGE = [
 HELP_COLUMNS = [
     ("LAST ACTIVE", "when the session last did something"), ("AGO", "time since then"),
     ("AGE", "time since it started"), ("STATE", "working, waiting (on you), review, done,"),
-    ("", "stopped; review = done, worktree still open"), ("ID", "job id, for claude attach"),
+    ("", "stopped; review = done, worktree still open"), ("ID", "session id, for attach or resume"),
     ("MODEL", "main thread's model"), ("EFFORT", "its reasoning effort"), ("RUN", "subagents running now"),
     ("SPAWNED", "subagents started in total"), ("BG", "background shells, monitors, crons"),
     ("CTX", "context tokens in use"), ("CTX %", "share of the context window (-w)"),
@@ -1145,14 +1391,18 @@ def run_update(cmd, latest):
         sys.exit(1)
 
 
-def attach(job_id):
-    """Open the session in this terminal (`claude attach <id>`) and wait until you leave it. Returns the note the
+def session_command(session_id, runtime="claude"):
+    return ["codex", "resume", session_id] if runtime == "codex" else ["claude", "attach", session_id]
+
+
+def attach(job_id, runtime="claude"):
+    """Open the session in this terminal and wait until you leave it. Returns the note the
     list shows when it comes back: empty after a clean exit, else what went wrong."""
-    cmd = ["claude", "attach", job_id]
+    cmd = session_command(job_id, runtime)
     try:
         proc = subprocess.Popen(cmd)
     except OSError as e:
-        return f" could not run `{shlex.join(cmd)}` ({e.strerror or e}): is claude on your PATH?"
+        return f" could not run `{shlex.join(cmd)}` ({e.strerror or e}): is {cmd[0]} on your PATH?"
     while True:
         try:
             code = proc.wait()
@@ -1176,9 +1426,10 @@ class Top:
         self.expanded = default_open(args.expand)
         self.idle_hours = args.idle_hours
         self.mouse = not args.no_mouse
+        self.runtime = args.runtime
         self.matched = 0
         self.sort = "last active"
-        self.usage = Usage(args.rate_hours)
+        self.usage = UnavailableUsage() if args.runtime == "codex" else Usage(args.rate_hours)
         self.rows, self.view = [], []
         self.cursor = self.top = 0
         self.message = ""
@@ -1212,7 +1463,7 @@ class Top:
     def reload(self, keep=True):
         """Refresh rows; keep the selected session under the cursor unless the view changed."""
         self.usage.refresh()
-        self.rows = load_rows()
+        self.rows = load_rows(runtime=self.runtime)
         self.relayout(keep)
         self.last_load = time.monotonic()
 
@@ -1269,7 +1520,7 @@ class Top:
 
     @property
     def header_rows(self):
-        return HEADER_ROWS + legend_shown()
+        return HEADER_ROWS + (legend_shown() if self.runtime == "claude" else 0)
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
@@ -1285,7 +1536,8 @@ class Top:
         h, w = self.scr.getmaxyx()
         now = datetime.now(timezone.utc)
         sessions, agents = summary(self.rows)
-        head = f" claude-top {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
+        command = "codex-top" if self.runtime == "codex" else "claude-top"
+        head = f" {command} {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
         self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
         self.put(1, 0, f" {agents}".ljust(w), curses.A_REVERSE)
         legend = self.header_rows - HEADER_ROWS
@@ -1445,7 +1697,7 @@ class Top:
             elif key == ord("c") and self.view and self.view[self.cursor].get("group"):
                 self.message = " a section line: enter or click opens it"
             elif key == ord("c") and self.view:
-                cmd = f"claude attach {self.view[self.cursor]['id']}"
+                cmd = shlex.join(session_command(self.view[self.cursor]["id"], self.runtime))
                 self.message = f" copied: {cmd}" if copy_to_clipboard(cmd) else f" {cmd}"
             elif key == ord("o"):
                 self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
@@ -1469,7 +1721,7 @@ class Top:
                 self.help_page = None
                 self.help = 0
             elif key == ord("i"):
-                self.help_page = HOW_TO_USE
+                self.help_page = HOW_TO_USE_CODEX if self.runtime == "codex" else HOW_TO_USE
                 self.help = 0
             elif key == ord("u") and self.latest:
                 cmd = update_command()
@@ -1630,6 +1882,12 @@ def main():
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"claude-top {__version__}")
+    default_runtime = "codex" if os.path.basename(sys.argv[0]) == "codex-top" else \
+        os.environ.get("CLAUDE_TOP_RUNTIME", "claude").lower()
+    if default_runtime not in RUNTIMES:
+        default_runtime = "claude"
+    ap.add_argument("--runtime", choices=RUNTIMES, default=default_runtime,
+                    help=f"session runtime to show (default {default_runtime})")
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default 2)")
     ap.add_argument("-s", "--state", choices=STATES[1:] + list(STATE_ALIASES),
                     help="only sessions in this state (blocked or waiting = needs your input)")
@@ -1671,13 +1929,19 @@ def main():
         try:
             action, value = curses.wrapper(screen)
             if action == "attach":
-                top.message = attach(value)
+                top.message = attach(value) if args.runtime == "claude" else attach(value, "codex")
             elif action == "update":
                 run_update(*value)  # returns only if the update failed and you went back
             else:
                 return
         except KeyboardInterrupt:
             return
+
+
+def codex_main():
+    """Console entry point for the same UI with the Codex backend selected by default."""
+    os.environ["CLAUDE_TOP_RUNTIME"] = "codex"
+    return main()
 
 
 if __name__ == "__main__":

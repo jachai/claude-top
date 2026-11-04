@@ -1,6 +1,6 @@
 # claude-top
 
-`top` for your Claude Code sessions: what each one is doing, what it's waiting on, and how fast you're using your plan.
+`top` for your Claude Code or Codex sessions: what each one is doing, what it's waiting on, and which agents it spawned.
 
 [![test](https://github.com/jachai/claude-top/actions/workflows/test.yml/badge.svg)](https://github.com/jachai/claude-top/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/claude-agents-top)](https://pypi.org/project/claude-agents-top/)
@@ -9,7 +9,7 @@
 
 ![claude-top demo](https://raw.githubusercontent.com/jachai/claude-top/main/docs/demo.gif)
 
-It's a live view of every background session showing when it was last active, what it's waiting on, its model, effort and context size, and the helpers it started. The header shows your 5-hour and weekly plan usage, how fast you're using it, and when you'd run out.
+It's a live view of every background session showing when it was last active, what it's waiting on, its model, effort and context size, and the helpers it started. In Codex mode, each row is a top-level thread and RUN/SPAWNED summarize its whole multi-agent tree. In Claude mode, the header also shows your 5-hour and weekly plan usage, how fast you're using it, and when you'd run out.
 
 ## Install
 
@@ -18,9 +18,12 @@ uv tool install claude-agents-top   # or: pipx install claude-agents-top
 uv tool install git+https://github.com/jachai/claude-top   # the latest from main
 ```
 
-The package is `claude-agents-top` on PyPI because `claude-top` there is an unrelated project. Both install a `claude-top` command, so don't install both. This one is a single file with no dependencies: Python 3.9+ on macOS or Linux (on Windows only `--once` works). You can also copy `claude_top.py` anywhere on your `PATH`.
+The package is `claude-agents-top` on PyPI because `claude-top` there is an unrelated project. It installs both
+`claude-top` (Claude by default) and `codex-top` (Codex by default); `claude-top --runtime codex` is equivalent.
+Don't install the unrelated `claude-top` package too. This one is a single file with no dependencies: Python 3.9+ on
+macOS or Linux (on Windows only `--once` works). You can also copy `claude_top.py` anywhere on your `PATH`.
 
-## Show plan usage (optional)
+## Show Claude plan usage (optional)
 
 Claude Code hands your plan limits to its status-line command, so claude-top needs to be that command to see them:
 
@@ -31,6 +34,9 @@ claude-top init --wrap   # already have a status line? keep it: record the limit
 
 Your status line then shows a line like `5h 38% 0.6x · week 54% 1.3x → out Fri 13:37` (with `--wrap`, your own line, unchanged). `--dry-run` shows the change, `--undo` puts things back. If you'd rather edit your own script, add `echo "$input" | claude-top record` to it.
 
+Codex's local session state does not expose equivalent plan-limit windows, so Codex mode labels those header rows
+unavailable instead of showing Claude usage as if it belonged to Codex.
+
 ## Use
 
 ```sh
@@ -39,6 +45,8 @@ claude-top -s waiting   # only sessions waiting for you (Claude Code calls it "b
 claude-top -g billing   # text filter
 claude-top --once       # print once and exit
 claude-top --expand     # start with every section open
+codex-top               # Codex threads and their spawned multi-agent trees
+claude-top --runtime codex --once
 ```
 
 Sessions sit in sections, like Claude Code's own agents view: **needs input** and **working** are open, while **review**, **done**, **stopped** and **idle 1d+** (anything with no activity for a day, whatever its state; `--idle-hours` changes it) are each folded into one line with how many sessions it holds and their names. So what is still going on is all you see. Enter or a click on a section's line opens or closes it, `→` `←` do the same from the keyboard, and `e` opens every section or puts them back. A state or text filter shows plain rows, no sections. Clicking needs the mouse; `--no-mouse` leaves it to your terminal for selecting text.
@@ -46,7 +54,7 @@ Sessions sit in sections, like Claude Code's own agents view: **needs input** an
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` | move |
-| `enter` | open the session (`claude attach <id>`); leave it and you are back in the list where you were. On a section's line, open / close it |
+| `enter` | open the session (`claude attach <id>` or `codex resume <id>`); leave it and you are back in the list where you were. On a section's line, open / close it |
 | `→` `←` / click | open / close a section (a click on a session selects it) |
 | `e` | open every section, or put them back |
 | `c` | copy the attach command |
@@ -61,6 +69,10 @@ Sessions sit in sections, like Claude Code's own agents view: **needs input** an
 | `q` | quit |
 
 ### With session-guide
+
+Claude Code mode keeps the title integration below. Codex mode reads no Claude title markers: ask a root Codex thread
+to use session-guide for its current tree, and `codex-top` shows the resulting agent activity by canonical
+`/root/...` paths.
 
 The top bar shows a legend of its title colors, once you have used it here: 🟥 manager, 🎟️ retired, 🟧 guided, ⬜ watched, 🟦 active, ✅ closed. Press `i` for what each means and how to use the guide.
 
@@ -81,12 +93,14 @@ A worker the guide has finished with shows as **done**, not waiting on you, even
 
 ## Reading it
 
-- **Header**: sessions by state (`work`ing, `wait`ing for you, `review` = finished in a worktree that's still open, `done`, `stop`ped), then what's running now: working sessions + subagents, subagents spawned in total, and background tasks.
+- **Header**: sessions by state (`work`ing, `wait`ing for you, `review` = finished in a Claude worktree that's still open, `done`, `stop`ped), then what's running now: working sessions + subagents, subagents spawned in total, and background tasks.
 - **Usage bars (5h, week)**: the bar fills with the % of the limit used, and `│` marks how much of the window (`time`) has passed. A bar filled past the `│` means you're ahead of budget.
 - **Speed (`1.3x`)**: % used ÷ % of time elapsed. `1.0x` lands exactly on 100% at reset, and `2.0x` runs out halfway through. The gauge's middle line is 1x. **now** is the speed over the last few hours (`--rate-hours`, default 3; the week uses a little more because limits come in whole percents).
 - **→**: when you'll run out at the current speed (and how early that is), or roughly where you'll end up at reset.
 - **LAST ACTIVE / AGE**: last activity vs. when the session was created. The built-in agents view only shows age.
-- **RUN / SPAWNED**: subagents running now / started in total. **BG**: background shells, monitors and crons in flight.
+- **RUN / SPAWNED**: subagents running now / started in total. In Codex mode these are all descendants of the root
+  thread, including nested agents; select the row to see active canonical paths. **BG** is Claude background shells,
+  monitors and crons in flight.
 - **CTX %**: context used, measured against a 1M window. Change it with `-w 200000` or `CLAUDE_TOP_CONTEXT_WINDOW`.
 
 ![claude-top screenshot](https://raw.githubusercontent.com/jachai/claude-top/main/docs/screenshot.png)
@@ -97,12 +111,19 @@ A worker the guide has finished with shows as **done**, not waiting on you, even
 python3 scripts/demo.py   # made-up sessions in a temp dir
 ```
 
-`CLAUDE_CONFIG_DIR` and `CLAUDE_TOP_RATE_LIMITS` override where it reads from; `CLAUDE_TOP_LIVE=0` skips `claude agents`. Running the tests and regenerating the images is covered in [CONTRIBUTING.md](CONTRIBUTING.md), and changes are listed in [CHANGELOG.md](CHANGELOG.md).
+`CLAUDE_CONFIG_DIR` and `CLAUDE_TOP_RATE_LIMITS` override Claude locations; `$CODEX_HOME` overrides Codex's location.
+`CLAUDE_TOP_RUNTIME=codex` changes the default backend. `CLAUDE_TOP_LIVE=0` skips `claude agents`. Running the tests
+and regenerating the images is covered in [CONTRIBUTING.md](CONTRIBUTING.md), and changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Notes
 
 - Session states and names come from `claude agents --json`, the same source as the built-in view. Everything else comes from Claude Code's local files (`~/.claude/jobs`, `~/.claude/projects`, and session-guide's `~/.claude/session-guide/guides`). They aren't a public API, so a Claude Code update can break a column; please [open an issue](https://github.com/jachai/claude-top/issues/new/choose) if it does.
+- Codex mode reads the latest local `~/.codex/state_*.sqlite` database in read-only mode and the rollout paths it
+  names. Task lifecycle events distinguish working, needs-input, and completed turns; `thread_spawn_edges` builds each
+  root's nested agent tree. These are local implementation details too, so an unknown or older schema fails open with
+  no rows instead of modifying or migrating it.
 - It reads only local files, and writes only its own files in `~/.claude/claude-top/` and, with `init`, the `statusLine` entry of `~/.claude/settings.json`. Once a day the full-screen view asks GitHub for the latest release's version number (nothing about you or your sessions is sent); turn that off with `CLAUDE_TOP_NO_UPDATE_CHECK=1`.
-- This is an independent project, not affiliated with Anthropic.
+- This is an independent project, not affiliated with Anthropic or OpenAI.
 
 MIT licensed.

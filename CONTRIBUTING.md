@@ -15,9 +15,9 @@ uv run --no-project --python 3.14 python -m unittest discover -s tests
 uvx pyflakes claude_top.py scripts tests
 ```
 
-Every test builds its own Claude config dir in a temp folder and sets `CLAUDE_TOP_LIVE=0` and
-`CLAUDE_TOP_NO_UPDATE_CHECK=1`, so nothing reads your real `~/.claude`, runs `claude` or asks GitHub for updates. New
-tests should do the same.
+Every test builds its own Claude or Codex config and database in a temp folder and sets `CLAUDE_TOP_LIVE=0` and
+`CLAUDE_TOP_NO_UPDATE_CHECK=1`, so nothing reads your real `~/.claude` / `~/.codex`, runs either CLI or asks GitHub
+for updates. New tests should do the same.
 
 ## Demo and images
 
@@ -34,7 +34,7 @@ before you commit. `docs/social-preview.png` is uploaded by hand under Settings 
 
 ## Privacy
 
-Never commit real session data: no transcripts, `state.json` files, session names, paths or plan usage from your own
+Never commit real session data: no transcripts, `state.json` files, Codex databases, session names, paths or plan usage from your own
 machine. This applies to tests, issues and screenshots. Use the demo data or made-up fixtures instead.
 
 ## Releases
