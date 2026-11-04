@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-04
+
+### Changed
+
+- Enter on a session runs `claude attach <id>` and waits for it. When you leave the session you are back in the list
+  where you were: same selection, filters, sort and open sections. claude-top used to hand the terminal over to
+  `claude attach` and exit.
+- Ctrl-C while attached goes to the session; claude-top keeps waiting for it.
+
+### Fixed
+
+- A missing `claude` or an attach that exits with an error no longer ends claude-top: the list comes back with
+  what happened on the bottom bar.
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed
@@ -111,7 +125,10 @@ All notable changes to this project are documented here. The format is based on
 - `claude-top statusline` and `claude-top record`, which record plan limits from Claude Code's status-line input.
 - `--once` output and a demo with made-up data.
 
-[Unreleased]: https://github.com/jachai/claude-top/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jachai/claude-top/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/jachai/claude-top/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/jachai/claude-top/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/jachai/claude-top/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jachai/claude-top/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/jachai/claude-top/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jachai/claude-top/compare/v0.3.0...v0.4.0

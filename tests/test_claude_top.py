@@ -753,6 +753,18 @@ class ScreenTest(Sandbox):
         self.assertIn("folded: 1", text)
         self.assertNotIn("1000h", self.run_screen(24, 160, [b"q"], argv=["--no-mouse"]))
 
+    def test_enter_attaches_and_comes_back_to_the_list(self):
+        self.working_session("job1")
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "claude").write_text('#!/bin/sh\necho "in session $2"\nexit 1\n')
+        (bin_dir / "claude").chmod(0o755)
+        text = self.run_screen(24, 160, [b"\n", b"q"], env={"PATH": f"{bin_dir}:/bin:/usr/bin"}, argv=["-s", "working"])
+        attached = text.find("in session job1")
+        self.assertGreaterEqual(attached, 0, text[-2000:])
+        self.assertIn("`claude attach job1` exited 1", text[attached:])
+        self.assertIn("job1", text[attached + len("in session job1"):])  # the list is drawn again
+
     def test_tiny_terminal_does_not_crash(self):
         for rows, cols in ((4, 12), (1, 1)):  # no rows, so the enter that a 1x1 prompt can't take attaches nothing
             self.run_screen(rows, cols, [b"?", b"j", b"x", b"/", b"a\n", b"q"])
@@ -914,6 +926,56 @@ class UpdateTest(Sandbox):
                 mock.patch("builtins.input", return_value=""):  # execv is stubbed, so run_update goes on
             self.ct.run_update([sys.executable, "-c", "pass"], "9.0.0")
         execv.assert_called_once_with(sys.executable, [sys.executable, os.path.abspath(self.ct.__file__), "-i", "5"])
+
+
+class AttachTest(Sandbox):
+    def fake_claude(self, code):
+        """A `claude` on PATH that records its arguments and exits with code."""
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        exe = bin_dir / "claude"
+        exe.write_text(f'#!/bin/sh\necho "$@" > "{self.home}/argv"\nexit {code}\n')
+        exe.chmod(0o755)
+        return mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+
+    def test_attach_waits_and_reports_how_it_ended(self):
+        with self.fake_claude(0):
+            self.assertEqual(self.ct.attach("job 1"), "")
+        self.assertEqual((self.home / "argv").read_text(), "attach job 1\n")
+        with self.fake_claude(3):
+            self.assertEqual(self.ct.attach("job1"), " `claude attach job1` exited 3")
+        with mock.patch.dict(os.environ, {"PATH": str(self.home / "empty")}):
+            note = self.ct.attach("job1")
+        self.assertTrue(note.startswith(" could not run `claude attach job1`"), note)
+        self.assertTrue(note.endswith("is claude on your PATH?"), note)
+
+    def test_ctrl_c_goes_to_the_session(self):
+        proc = mock.Mock()
+        proc.wait.side_effect = [KeyboardInterrupt, 0]
+        with mock.patch.object(self.ct.subprocess, "Popen", return_value=proc):
+            self.assertEqual(self.ct.attach("job1"), "")
+        self.assertEqual(proc.wait.call_count, 2)
+        proc.kill.assert_not_called()
+
+    @unittest.skipIf(claude_top.curses is None, "no curses")
+    def test_leaving_a_session_reopens_the_same_list(self):
+        screens, seen = [object(), object()], []
+        results = iter([("attach", "job1"), ("quit", None)])
+
+        def run(top):
+            seen.append((top, top.scr, top.message))
+            return next(results)
+
+        with mock.patch.object(sys, "argv", ["claude-top"]), mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(self.ct.curses, "wrapper", side_effect=lambda fn: fn(screens[len(seen)])), \
+                mock.patch.object(self.ct.Top, "run", run), \
+                mock.patch.object(self.ct, "attach", return_value=" `claude attach job1` exited 1") as attach:
+            self.ct.main()
+        attach.assert_called_once_with("job1")
+        (first, scr1, _), (second, scr2, note) = seen
+        self.assertIs(first, second)  # same cursor, filters, sort and open sections
+        self.assertEqual((scr1, scr2), tuple(screens))
+        self.assertEqual(note, " `claude attach job1` exited 1")
 
 
 class InitTest(Sandbox):

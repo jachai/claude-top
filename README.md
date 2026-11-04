@@ -46,7 +46,7 @@ Sessions sit in sections, like Claude Code's own agents view: **needs input** an
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` | move |
-| `enter` | open the session (`claude attach <id>`), or open / close a section |
+| `enter` | open the session (`claude attach <id>`); leave it and you are back in the list where you were. On a section's line, open / close it |
 | `→` `←` / click | open / close a section (a click on a session selects it) |
 | `e` | open every section, or put them back |
 | `c` | copy the attach command |

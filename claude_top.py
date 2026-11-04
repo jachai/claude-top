@@ -47,7 +47,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -934,7 +934,7 @@ def row_line(cells, note, width):
 
 HELP_KEYS = [
     ("↑ ↓  j k", "move"), ("PgUp PgDn", "page up / down"), ("g  G", "top / bottom"),
-    ("enter", "attach, or open / close a section"), ("→  ←", "open / close a section"),
+    ("enter", "attach; on a section, open / close"), ("→  ←", "open / close a section"),
     ("e", "open every section / put back"), ("click", "select; on a section, open / close"),
     ("c", "copy the attach command"), ("o", "next sort order"),
     ("f", "next state filter"), ("/", "text filter (empty clears it)"), ("r", "show / hide retired guides"),
@@ -1143,6 +1143,23 @@ def run_update(cmd, latest):
         input("press Enter to go back to claude-top, or ctrl-c to quit ")
     except EOFError:
         sys.exit(1)
+
+
+def attach(job_id):
+    """Open the session in this terminal (`claude attach <id>`) and wait until you leave it. Returns the note the
+    list shows when it comes back: empty after a clean exit, else what went wrong."""
+    cmd = ["claude", "attach", job_id]
+    try:
+        proc = subprocess.Popen(cmd)
+    except OSError as e:
+        return f" could not run `{shlex.join(cmd)}` ({e.strerror or e}): is claude on your PATH?"
+    while True:
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:  # ctrl-c is for the session; claude-top waits for it to end
+            continue
+    return f" `{shlex.join(cmd)}` exited {code}" if code else ""
 
 
 # ---------------------------------------------------------------- full screen
@@ -1641,19 +1658,26 @@ def main():
         except BrokenPipeError:  # e.g. piped into head
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return
+    top = None
+
+    def screen(scr):
+        nonlocal top  # one Top for the whole run, so the list comes back as you left it
+        if top is None:
+            top = Top(scr, args)
+        top.scr = scr
+        return top.run()
+
     while True:
         try:
-            action, value = curses.wrapper(lambda scr: Top(scr, args).run())
-            if action != "update":
-                break
-            run_update(*value)  # returns only if the update failed and you went back
+            action, value = curses.wrapper(screen)
+            if action == "attach":
+                top.message = attach(value)
+            elif action == "update":
+                run_update(*value)  # returns only if the update failed and you went back
+            else:
+                return
         except KeyboardInterrupt:
             return
-    if action == "attach":
-        try:
-            os.execvp("claude", ["claude", "attach", value])
-        except OSError:
-            sys.exit(f"could not run `claude attach {value}`: is claude on your PATH?")
 
 
 if __name__ == "__main__":
