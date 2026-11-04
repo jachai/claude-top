@@ -2,6 +2,7 @@ name: test
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_call:   # the release workflow runs the same matrix first
 
@@ -10,9 +11,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        # uv ships its own Python builds, so 3.9 keeps working after runner images drop it
-        python: ["3.9", "3.14"]
+        # Keep the full Python matrix on Linux and one macOS platform leg. uv ships
+        # its own Python builds, so 3.9 keeps working after runner images drop it.
+        include:
+          - {os: ubuntu-latest, python: "3.9"}
+          - {os: ubuntu-latest, python: "3.14"}
+          - {os: macos-latest, python: "3.14"}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

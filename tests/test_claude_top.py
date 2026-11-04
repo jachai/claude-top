@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -504,6 +505,125 @@ class RowsTest(Sandbox):
         sessions, agents = self.ct.summary(list(self.rows().values()))
         self.assertEqual(sessions, "sessions 2: 1 work · 1 wait · 0 done · 0 stop")
         self.assertEqual(agents, "agents now 2 (1 sess + 1 sub) │ spawned 1 (1 live) │ bg 0")
+
+
+class CodexRowsTest(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.codex = self.home / ".codex"
+        self.db = self.codex / "state_5.sqlite"
+        self.codex.mkdir()
+        os.environ["CODEX_HOME"] = str(self.codex)
+        os.environ["CLAUDE_TOP_CODEX_STATE_DB"] = str(self.db)
+        self.ct = importlib.reload(claude_top)
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            db.executescript("""
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+                    created_at_ms INTEGER, updated_at_ms INTEGER, cwd TEXT, title TEXT, name TEXT,
+                    preview TEXT, model TEXT, reasoning_effort TEXT, agent_path TEXT, agent_nickname TEXT,
+                    thread_source TEXT, archived INTEGER
+                );
+                CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT, child_thread_id TEXT PRIMARY KEY, status TEXT
+                );
+            """)
+            db.commit()
+
+    def rollout(self, sid, events):
+        path = self.codex / "sessions" / "2026" / "11" / "04" / f"rollout-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps({"timestamp": iso(self.now), **event}) + "\n" for event in events))
+        return path
+
+    def thread(self, sid, rollout, source="user", path=None, model="gpt-test-sol", effort="high", name=None):
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            db.execute("INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                sid, str(rollout), int(self.now - H), int(self.now), int((self.now - H) * 1000), int(self.now * 1000),
+                "/tmp/repo", name or f"thread {sid[-1]}", name or f"thread {sid[-1]}", "preview", model, effort,
+                path, path and path.rsplit("/", 1)[-1], source, 0))
+            db.commit()
+
+    def edge(self, parent, child, status="open"):
+        with contextlib.closing(sqlite3.connect(self.db)) as db:
+            db.execute("INSERT INTO thread_spawn_edges VALUES (?,?,?)", (parent, child, status))
+            db.commit()
+
+    @staticmethod
+    def event(kind, payload):
+        return {"type": kind, "payload": payload}
+
+    def test_root_row_summarizes_descendant_agent_tree(self):
+        root = "01a10000-0000-7000-8000-000000000000"
+        child = "01a10001-0000-7000-8000-000000000000"
+        grandchild = "01a10002-0000-7000-8000-000000000000"
+        root_log = self.rollout(root, [
+            self.event("event_msg", {"type": "task_started"}),
+            self.event("turn_context", {"model": "gpt-root", "effort": "medium"}),
+            self.event("response_item", {"type": "function_call", "name": "wait_agent", "call_id": "wait"}),
+            self.event("token_usage_record", {"usage": {"input_tokens": 120000}}),
+        ])
+        child_log = self.rollout(child, [self.event("event_msg", {"type": "task_started"}),
+                                         self.event("event_msg", {"type": "task_complete"})])
+        grandchild_log = self.rollout(grandchild, [self.event("event_msg", {"type": "task_started"})])
+        self.thread(root, root_log, name="release root")
+        self.thread(child, child_log, source="subagent", path="/root/review", model="gpt-review")
+        self.thread(grandchild, grandchild_log, source="subagent", path="/root/review/tests", model="gpt-test")
+        self.edge(root, child)
+        self.edge(child, grandchild)
+
+        rows = self.ct.load_rows(runtime="codex")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["id"], root)
+        self.assertEqual(row["name"], "release root")
+        self.assertEqual(row["state"], "working")
+        self.assertEqual(row["ctx"], 120000)
+        self.assertEqual(row["agents"]["total"], 2)
+        self.assertEqual(row["agents"]["running"], 1)
+        self.assertEqual(row["agents"]["active"], ["/root/review/tests"])
+        self.assertIn("gpt-review", row["agents"]["models"])
+
+    def test_open_user_question_is_blocked_and_completed_turn_is_done(self):
+        blocked = "01a20000-0000-7000-8000-000000000000"
+        done = "01a20001-0000-7000-8000-000000000000"
+        blocked_log = self.rollout(blocked, [
+            self.event("event_msg", {"type": "task_started"}),
+            self.event("response_item", {"type": "function_call", "name": "request_user_input", "call_id": "q1"}),
+        ])
+        done_log = self.rollout(done, [self.event("event_msg", {"type": "task_started"}),
+                                       self.event("event_msg", {"type": "task_complete"})])
+        self.thread(blocked, blocked_log, name="needs choice")
+        self.thread(done, done_log, name="finished")
+        rows = {r["name"]: r for r in self.ct.load_rows(runtime="codex")}
+        self.assertEqual(rows["needs choice"]["state"], "blocked")
+        self.assertEqual(rows["finished"]["state"], "done")
+
+    def test_closed_spawn_edge_is_not_running(self):
+        root = "01a30000-0000-7000-8000-000000000000"
+        child = "01a30001-0000-7000-8000-000000000000"
+        root_log = self.rollout(root, [self.event("event_msg", {"type": "task_complete"})])
+        child_log = self.rollout(child, [self.event("event_msg", {"type": "task_started"})])
+        self.thread(root, root_log)
+        self.thread(child, child_log, source="subagent", path="/root/old")
+        self.edge(root, child, "closed")
+        row = self.ct.load_rows(runtime="codex")[0]
+        self.assertEqual(row["agents"]["total"], 1)
+        self.assertEqual(row["agents"]["running"], 0)
+
+    def test_long_active_rollout_finds_task_start_before_tail(self):
+        sid = "01a40000-0000-7000-8000-000000000000"
+        path = self.codex / "sessions" / "2026" / "11" / "04" / f"rollout-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        started = {"timestamp": iso(self.now), "type": "event_msg", "payload": {"type": "task_started"}}
+        padding = {"timestamp": iso(self.now), "type": "response_item",
+                   "payload": {"type": "reasoning", "summary": "x" * (self.ct.MAX_TAIL_BYTES + 100)}}
+        path.write_text(json.dumps(started) + "\n" + json.dumps(padding) + "\n")
+        self.assertEqual(self.ct.codex_rollout_info(str(path))["state"], "working")
+
+    def test_codex_resume_command(self):
+        self.assertEqual(self.ct.session_command("abc", "codex"), ["codex", "resume", "abc"])
+        self.assertEqual(self.ct.session_command("job1"), ["claude", "attach", "job1"])
 
 
 class CliTest(Sandbox):

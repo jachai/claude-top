@@ -5,7 +5,24 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Codex sessions and multi-agent trees: `codex-top` (or `claude-top --runtime codex`) reads Codex's local state
+  database in read-only mode, shows one row per top-level thread, counts nested spawned/running agents, lists active
+  canonical agent paths in the detail, and derives working / needs-input / done from rollout task lifecycle events.
+- Enter resumes a Codex thread with `codex resume <id>`; `c` copies that command. The existing Claude behavior and
+  `claude-top` default remain unchanged.
+
+### Changed
+
+- Codex mode explicitly marks plan-limit rows unavailable instead of displaying recorded Claude plan usage.
+
 ### Fixed
+
+- Feature branches run the test matrix once through `pull_request` instead of duplicating it through both `push` and
+  `pull_request`. Direct `main` pushes remain covered, and version tags use the release workflow's matrix call. The
+  full Python 3.9/3.14 compatibility matrix runs on Ubuntu, with latest Python also covering macOS, reducing scarce
+  hosted macOS demand from four jobs per feature update to one after jobs were cancelled in queue with no steps.
 
 - A guide whose ledger row reads RETIRED behind markdown or an emoji (`**RETIRED**`, `🎟️ RETIRED`) keeps its title
   instead of getting the finished check mark. The check stripped a literal `\W` instead of leading punctuation, and
