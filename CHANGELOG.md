@@ -19,6 +19,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- Feature branches run the test matrix once through `pull_request` instead of duplicating it through both `push` and
+  `pull_request`. Direct `main` pushes remain covered, and version tags use the release workflow's matrix call; this
+  avoids competing duplicate macOS jobs being cancelled in the hosted-runner queue with no steps executed.
+
 - A guide whose ledger row reads RETIRED behind markdown or an emoji (`**RETIRED**`, `🎟️ RETIRED`) keeps its title
   instead of getting the finished check mark. The check stripped a literal `\W` instead of leading punctuation, and
   newer Pythons warned about it (SyntaxWarning: invalid escape sequence).
