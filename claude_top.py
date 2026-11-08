@@ -47,7 +47,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -68,7 +68,22 @@ DESKTOP_HISTORY = Path.home() / "Library" / "Application Support" / "Claude" / "
 
 TAIL_BYTES = 512 * 1024
 MAX_TAIL_BYTES = 2 * 1024 * 1024
-DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or 1_000_000)
+
+
+def guard_window():
+    """agent-guard's context_ask_tokens (the limit it stops a session at), else 200k."""
+    home = os.environ.get("AGENT_GUARD_HOME") or os.path.expanduser("~/.agent-guard")
+    try:
+        with open(os.path.join(home, "config.json")) as fh:
+            value = int(json.load(fh)["context_ask_tokens"])
+        if value > 0:
+            return value
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 200_000
+
+
+DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or guard_window())
 SUBAGENT_IDLE_MINUTES = 15
 IDLE_HOURS = float(os.environ.get("CLAUDE_TOP_IDLE_HOURS") or 24)
 
@@ -464,7 +479,7 @@ def scan_lines(lines, info):
                 continue
             info["ctx"] = sum(
                 usage.get(k) or 0
-                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
             )
             info["model"] = info["model"] or msg.get("model")
             info["effort"] = info["effort"] or e.get("perTurnEffort")

@@ -87,7 +87,7 @@ A worker the guide has finished with shows as **done**, not waiting on you, even
 - **→**: when you'll run out at the current speed (and how early that is), or roughly where you'll end up at reset.
 - **LAST ACTIVE / AGE**: last activity vs. when the session was created. The built-in agents view only shows age.
 - **RUN / SPAWNED**: subagents running now / started in total. **BG**: background shells, monitors and crons in flight.
-- **CTX %**: context used, measured against a 1M window. Change it with `-w 200000` or `CLAUDE_TOP_CONTEXT_WINDOW`.
+- **CTX %**: context used (input + cache read + cache creation, no output), measured against agent-guard's `context_ask_tokens` (200k by default). Change it with `-w 1000000` or `CLAUDE_TOP_CONTEXT_WINDOW`.
 
 ![claude-top screenshot](https://raw.githubusercontent.com/jachai/claude-top/main/docs/screenshot.png)
 

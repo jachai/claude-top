@@ -39,7 +39,7 @@ def api_request(model=MODEL, effort="high", source="repl_main_thread"):
 
 
 def assistant(ctx, content=(), model=MODEL, sidechain=False, effort=None, at=None):
-    usage = {"input_tokens": 10, "cache_read_input_tokens": ctx - 40, "cache_creation_input_tokens": 20, "output_tokens": 10}
+    usage = {"input_tokens": 10, "cache_read_input_tokens": ctx - 30, "cache_creation_input_tokens": 20, "output_tokens": 10}
     event = {"type": "assistant", "isSidechain": sidechain, "message": {"model": model, "usage": usage, "content": list(content)}}
     if effort:
         event["perTurnEffort"] = effort
@@ -271,6 +271,18 @@ class TranscriptTest(Sandbox):
             fh.write(json.dumps(assistant(9000, [tool_use("more")])) + "\n")
         os.utime(path, (self.now + 5, self.now + 5))
         self.assertEqual(self.ct.transcript_info(str(path))["ctx"], 9000)
+
+    def test_ctx_excludes_output_tokens(self):
+        path = self.transcript("s1", [assistant(1000)])  # fixture usage carries 10 output tokens
+        self.assertEqual(self.ct.transcript_info(str(path))["ctx"], 1000)
+
+    def test_window_reads_agent_guard_config_else_200k(self):
+        self.assertEqual(self.ct.guard_window(), 200_000)
+        guard = self.home / "g"
+        guard.mkdir()
+        (guard / "config.json").write_text('{"context_ask_tokens": 150000}')
+        with mock.patch.dict(os.environ, {"AGENT_GUARD_HOME": str(guard)}):
+            self.assertEqual(self.ct.guard_window(), 150_000)
 
     def test_short_model(self):
         self.assertEqual(self.ct.short_model("claude-opus-5-5"), "opus 5.5")

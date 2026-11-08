@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-08
+
+### Fixed
+
+- CTX % matches agent-guard: output tokens are no longer counted, and the window is agent-guard's
+  `context_ask_tokens` (read from `~/.agent-guard/config.json`, 200k if absent) instead of 1M. A session at 155k showed
+  16% while the guard was at 78% of its stop limit. `-w` and `CLAUDE_TOP_CONTEXT_WINDOW` still override.
+
 ### Fixed
 
 - A guide whose ledger row reads RETIRED behind markdown or an emoji (`**RETIRED**`, `🎟️ RETIRED`) keeps its title
