@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Rename the installed command and terminal UI to `agents-top`, including status-line setup, update/restart messages, help, and examples. `claude-top` still works as an alias. The distribution remains `claude-agents-top`, and existing saved data stays in `~/.claude/claude-top/`.
+
+### Added
+
+- Codex sessions alongside Claude Code sessions, with a TOOL column, saved thread names, inferred turn status, model, reasoning effort, context usage, and child-agent counts. Reads local rollout logs under `CODEX_HOME` (default `~/.codex`), excluding archived sessions.
+- Enter and copy use the selected provider's command: `claude attach`, `claude --resume` for an interactive session, or `codex resume` in the session's working directory. Leaving any of them brings you back to the list. The header labels plan usage as Claude usage.
+
 ## [0.6.3] - 2026-11-08
 
 ### Fixed
