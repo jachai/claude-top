@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run claude-top against made-up sessions, or render that view to images.
+"""Run agents-top against made-up sessions, or render that view to images.
 
   python3 scripts/demo.py                       # interactive demo, nothing real is read
   uv run --no-project --with pyte --with pillow python scripts/demo.py --screenshot docs/screenshot.png
@@ -21,25 +21,25 @@ ROOT = Path(__file__).resolve().parent.parent
 # name, state, minutes since last active, hours since created, model, effort, context tokens,
 # subagents (running, finished), background tasks, note
 SESSIONS = [
-    ("api rate-limit middleware", "working", 0.1, 1.2, "claude-opus-5-5", "high", 182_000, (2, 3), 1,
+    ("api rate-limit middleware", "working", 0.1, 1.2, "claude-opus-5-5", "high", 142_000, (2, 3), 1,
      "Running the integration suite against the new limiter"),
     ("flaky checkout e2e test", "blocked", 2, 3.5, "claude-sonnet-5-5", "medium", 96_000, (0, 1), 0,
      "Fix the clock mock, or retry the test 3x in CI?"),
     ("docs site dark mode", "working", 4, 0.6, "claude-sonnet-5-5", "medium", 61_000, (1, 1), 0,
      "Checking contrast on code blocks"),
-    ("billing webhook retries", "review", 25, 30, "claude-opus-5-5", "high", 298_000, (0, 4), 0,
+    ("billing webhook retries", "review", 25, 30, "claude-opus-5-5", "high", 118_000, (0, 4), 0,
      "PR #812 ready: idempotent retries with a dead-letter queue"),
-    ("postgres 17 upgrade plan", "blocked", 38, 26, "claude-opus-5-5", "high", 415_000, (0, 6), 0,
+    ("postgres 17 upgrade plan", "blocked", 38, 26, "claude-opus-5-5", "high", 164_000, (0, 6), 0,
      "Maintenance window: Sat 02:00 or Sun 02:00?"),
     ("release notes v2.4", "done", 55, 5, "claude-haiku-5-5", "low", 24_000, (0, 0), 0,
      "Drafted in CHANGELOG.md; 14 PRs grouped by area"),
     ("onboarding email copy", "blocked", 300, 50, "claude-sonnet-5-5", "medium", 88_000, (0, 0), 0,
      "Subject line A \"Welcome aboard\" or B \"You're in\"?"),
-    ("search index rebuild", "done", 610, 70, "claude-opus-5-5", "high", 640_000, (0, 12), 0,
+    ("search index rebuild", "done", 610, 70, "claude-opus-5-5", "high", 171_000, (0, 12), 0,
      "Rebuilt in 41 min (was 3h); benchmark in docs/"),
     ("ios crash triage", "stopped", 1500, 96, "claude-sonnet-5-5", "medium", 152_000, (0, 2), 0,
      "Stopped by user"),
-    ("terraform drift report", "done", 2900, 140, "claude-opus-5-5", "medium", 205_000, (0, 3), 0,
+    ("terraform drift report", "done", 2900, 140, "claude-opus-5-5", "medium", 105_000, (0, 3), 0,
      "3 drifted resources; fixes in PR #790"),
     ("dependency audit", "done", 4400, 200, "claude-haiku-5-5", "low", 41_000, (0, 0), 0,
      "No critical advisories; 6 minor bumps queued"),
@@ -93,6 +93,25 @@ def build(home):
             "createdAt": iso(created), "updatedAt": iso(last),
             "inFlight": {"tasks": running + bg, "kinds": kinds},
         }))
+
+    codex = home / ".codex"
+    sessions = codex / "sessions" / "2026" / "10" / "26"
+    sessions.mkdir(parents=True)
+    index = []
+    for name, ending, age in (("Codex: simplify the event parser", "task_started", 30),
+                              ("Codex: review the migration", "task_complete", 900)):
+        sid = str(uuid.uuid4())
+        records = [
+            {"type": "session_meta", "payload": {"id": sid, "cwd": "/home/dev/acme-app", "timestamp": iso(now - 3600)}},
+            {"type": "turn_context", "payload": {"model": "gpt-5.3-codex", "effort": "high"}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 58000, "output_tokens": 2000}, "model_context_window": 200000}}},
+            {"type": "event_msg", "payload": {"type": ending, "last_agent_message": "Checking the parser edge cases"}},
+        ]
+        (sessions / f"rollout-{sid}.jsonl").write_text("".join(
+            json.dumps({"timestamp": iso(now - age), **r}) + "\n" for r in records))
+        index.append({"id": sid, "thread_name": name})
+    (codex / "session_index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in index))
 
     data = home / "claude-top"
     data.mkdir()
@@ -225,7 +244,7 @@ def gif(env, out, cols=160, rows=24):
     print(f"wrote {out} ({frames[0].width}x{frames[0].height}, {len(frames)} frames, {os.path.getsize(out) // 1024} KB)")
 
 
-def social(env, out, tagline="A live, top-style view of your Claude Code sessions and plan usage"):
+def social(env, out, tagline="A live view of Claude Code and Codex sessions"):
     """A 1280x640 card: the name, the tagline and the top of the TUI."""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -234,7 +253,7 @@ def social(env, out, tagline="A live, top-style view of your Claude Code session
     tui = render(capture(env, [(b"", 1.5)], 130, 18)[-1], size=14, pad=14)
     x, y = (card.width - tui.width) // 2, 230
     regular, bold = load_fonts(64)
-    draw.text((x, 44), "claude-top", font=bold, fill=FOREGROUND)
+    draw.text((x, 44), "agents-top", font=bold, fill=FOREGROUND)
     draw.text((x, 136), tagline, font=ImageFont.truetype(regular.path, 26, index=regular.index), fill=PALETTE["cyan"])
     draw.rounded_rectangle([x - 1, y - 30, x + tui.width, y + tui.height - 8], radius=10, fill=BACKGROUND, outline="#3b3f5c")
     for i, color in enumerate(("red", "yellow", "green")):
@@ -253,7 +272,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
         build(home)
-        env = {"CLAUDE_CONFIG_DIR": str(home), "CLAUDE_TOP_RATE_LIMITS": str(home / "claude-top" / "rate_limits.json"),
+        env = {"CLAUDE_CONFIG_DIR": str(home), "CODEX_HOME": str(home / ".codex"), "CLAUDE_TOP_CONTEXT_WINDOW": "200000",
+               "CLAUDE_TOP_RATE_LIMITS": str(home / "claude-top" / "rate_limits.json"),
                "CLAUDE_TOP_LIVE": "0", "HOME": str(home),  # no real sessions from `claude agents` or the desktop app
                "CLAUDE_TOP_NO_UPDATE_CHECK": "1"}  # and no request to GitHub
         if args.screenshot or args.gif or args.social:

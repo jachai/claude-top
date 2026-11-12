@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""claude-top: a live, top-style view of your Claude Code background sessions and plan usage.
+"""agents-top: a live, top-style view of Claude Code and Codex sessions.
 
-  claude-top                  full screen, refreshes every 2s
-  claude-top -i 5             refresh every 5s
-  claude-top -s waiting       start filtered to sessions waiting for input (or -s blocked)
-  claude-top -g billing       start with a text filter
-  claude-top --once           print once and exit
-  claude-top init             set claude-top as your Claude Code status line (--wrap keeps an existing one)
-  claude-top statusline       status-line command: records plan limits, prints a short usage line
-  claude-top record           same, but prints nothing (pipe your own status line's input into it)
+  agents-top                  full screen, refreshes every 2s
+  agents-top -i 5             refresh every 5s
+  agents-top -s waiting       start filtered to sessions waiting for input (or -s blocked)
+  agents-top -g billing       start with a text filter
+  agents-top --once           print once and exit
+  agents-top init             set agents-top as your Claude Code status line (--wrap keeps an existing one)
+  agents-top statusline       status-line command: records plan limits, prints a short usage line
+  agents-top record           same, but prints nothing (pipe your own status line's input into it)
 
 Keys: up/down j/k move, PgUp/PgDn page, g/G top/bottom, enter attach, c copy the attach command,
 o sort, f state filter, / text filter, r show retired guides, +/- refresh speed, space refresh now, ? help,
@@ -50,6 +50,7 @@ except ImportError:  # Windows: only --once works
 __version__ = "0.6.3"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+CODEX_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 JOBS = CLAUDE_DIR / "jobs"
 PROJECTS = CLAUDE_DIR / "projects"
 DATA_DIR = CLAUDE_DIR / "claude-top"
@@ -107,7 +108,7 @@ LEGEND = (" \U0001f7e5 manager  \U0001f39f\ufe0f retired  \U0001f7e7 guided  \u2
           "  \u2705 closed ")  # session-guide's title colors; shown once it has been used here
 HOW_TO_USE = [
     "how to use",
-    "  Each row is a Claude Code session. Press enter to open one, c to copy",
+    "  Each row is a Claude Code or Codex session. Press enter to open one, c to copy",
     "  the command that opens it. Sessions waiting on you come first.",
     "",
     "  Keep an eye on the state: needs input means a session is stuck until",
@@ -136,6 +137,8 @@ HOW_TO_USE = [
 _transcript_cache = {}
 _path_cache = {}
 _agents_cache = {}
+_codex_cache = {}
+_codex_names_cache = None
 
 
 # ---------------------------------------------------------------- helpers
@@ -189,6 +192,8 @@ def short_model(model):
     """claude-opus-4-1-20250805 -> opus 4.1"""
     if not model:
         return "-"
+    if not str(model).startswith("claude-"):
+        return str(model)
     model = re.sub(r"-\d{8}$", "", str(model))
     return model.replace("claude-", "").replace("-", " ", 1).replace("-", ".")
 
@@ -372,11 +377,11 @@ def pace_level(pace):
 def usage_segments(w, now):
     """One header line per limit, as [(text, color level)]."""
     if w["used"] is None:
-        return [(f" {w['label']:<5}", "bold"), ("no data yet: run `claude-top init` to record your plan limits", "dim")]
+        return [(f" Claude {w['label']:<5}", "bold"), ("no data yet: run `agents-top init` to record your plan limits", "dim")]
     level = pace_level(w["pace"])
     reset_local = datetime.fromtimestamp(w["resets"]).strftime("%a %H:%M")
     segs = [
-        (f" {w['label']:<5}", "bold"),
+        (f" Claude {w['label']:<5}", "bold"),
         (usage_bar(w["used"], w["elapsed"], 20), level),
         (f" {w['used']:>3.0f}% used · {w['elapsed'] * 100:>2.0f}% time · reset {reset_local} ({span(w['resets'] - now)}) · ", None),
         (f"{w['pace']:.1f}x ", level),
@@ -657,6 +662,39 @@ def live_sessions():
         return {}
 
 
+def registered_sessions():
+    """Open CLI sessions omitted by some versions of `claude agents`. Never read peer-token files."""
+    sessions = {}
+    for path in (CLAUDE_DIR / "sessions").glob("*.json"):
+        entry = load_json(path)
+        if not isinstance(entry, dict):
+            continue
+        sid, pid = entry.get("sessionId"), entry.get("pid")
+        if not isinstance(sid, str) or not sid or type(pid) is not int or pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # an existing process owned by another user
+        except (OSError, OverflowError):
+            continue
+        times = {}
+        try:
+            for source, target in (("startedAt", "createdAt"), ("updatedAt", "updatedAt")):
+                if isinstance(entry.get(source), (int, float)):
+                    times[target] = datetime.fromtimestamp(entry[source] / 1000, tz=timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            continue
+        status = entry.get("status")
+        state = {"idle": "blocked", "busy": "working", "working": "working",
+                 "waiting": "blocked", "blocked": "blocked"}.get(status) if isinstance(status, str) else None
+        cwd = entry.get("cwd") if isinstance(entry.get("cwd"), str) else ""
+        sessions[sid] = {"id": sid, "sessionId": sid, "pid": pid, "kind": entry.get("kind") or "interactive",
+                         "state": state or "?", "name": entry.get("name") or Path(cwd).name,
+                         "cwd": cwd, **times}
+    return sessions
+
+
 def merge_live(state, live_entry):
     """state.json overlaid with the agents view, whose state and name are current; state.json catches up later.
 
@@ -672,6 +710,10 @@ def merge_live(state, live_entry):
     merged = {**state, "state": live_state, "name": live_entry.get("name") or state.get("name"),
               "sessionId": state.get("sessionId") or live_entry.get("sessionId"),
               "cwd": state.get("cwd") or live_entry.get("cwd")}
+    for field in ("createdAt", "updatedAt"):
+        incoming, current = parse_ts(live_entry.get(field)), parse_ts(merged.get(field))
+        if incoming and (not current or (field == "updatedAt" and incoming > current)):
+            merged[field] = live_entry[field]
     if not merged.get("createdAt") and isinstance(live_entry.get("startedAt"), int):
         merged["createdAt"] = datetime.fromtimestamp(live_entry["startedAt"] / 1000, tz=timezone.utc).isoformat()
     return merged
@@ -698,10 +740,17 @@ def load_rows(live_list=None):
     if live_list is None:
         live_list = live_sessions()
     state_files = {p.parent.name: p for p in JOBS.glob("*/state.json")}
-    for job_id in set(state_files) | {i for i, x in live_list.items() if x.get("kind") != "background"}:
+    states = {job_id: load_json(path) or {} for job_id, path in state_files.items()}
+    known = {state.get("sessionId"): job_id for job_id, state in states.items() if state.get("sessionId")}
+    known.update({entry["sessionId"]: job_id for job_id, entry in live_list.items() if entry.get("sessionId")})
+    live_list = dict(live_list)
+    for sid, entry in registered_sessions().items():
+        job_id = known.get(sid, sid)
+        live_list[job_id] = {**entry, **live_list.get(job_id, {})}
+    for job_id in set(state_files) | set(live_list):
         state_file = state_files.get(job_id)
         live_entry = live_list.get(job_id) or {}
-        state = (load_json(state_file) if state_file else None) or {}
+        state = states.get(job_id) or {}
         if not state and not live_entry:
             continue
         state = merge_live(state, live_entry)
@@ -733,11 +782,12 @@ def load_rows(live_list=None):
             note = t["activity"]  # state.json still holds the note from before this turn
         rows.append({
             "id": clean(job_id),
+            "provider": "claude",
             "kind": live_entry.get("kind") or "background",
             "state": state.get("state") or "?",
             "name": name,
             "note": clean(note),
-            "search": " ".join(str(state.get(k) or "") for k in ("name", "intent", "needs", "detail", "cwd")).lower(),
+            "search": "claude " + " ".join(str(state.get(k) or "") for k in ("name", "intent", "needs", "detail", "cwd")).lower(),
             "cwd": clean(state.get("cwd") or ""),
             "session": clean(state.get("resumeSessionId") or state.get("sessionId") or ""),
             "last": last,
@@ -751,7 +801,189 @@ def load_rows(live_list=None):
             "guide": guide,
             "ledger": clean(ledger or ""),
         })
-    return apply_guide_done(rows)
+    return apply_guide_done(rows) + codex_rows()
+
+
+# ---------------------------------------------------------------- Codex sessions
+
+
+def codex_info(path):
+    try:
+        st = path.stat()
+        stamp = (st.st_size, st.st_mtime_ns, st.st_ino)
+        cached = _codex_cache.get(path)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        with path.open("rb") as fh:
+            meta = json.loads(fh.readline(MAX_TAIL_BYTES))
+            if not isinstance(meta, dict) or meta.get("type") != "session_meta":
+                return None
+            meta = meta.get("payload")
+            if not isinstance(meta, dict) or not isinstance(meta.get("id"), str) or not meta["id"]:
+                return None
+            meta_end = fh.tell()
+            tail_start = max(0, st.st_size - MAX_TAIL_BYTES)
+            fh.seek(tail_start)
+            lines = fh.read().splitlines()
+            if st.st_size > MAX_TAIL_BYTES:
+                lines = lines[1:]
+    except (OSError, ValueError):
+        return None
+    cwd = clean(meta.get("cwd") or "")
+    source = meta.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    info = {"id": clean(meta["id"]), "provider": "codex", "session": clean(meta["id"]),
+            "kind": "subagent" if parent else "interactive", "parent": clean(parent) if parent else None,
+            "cwd": cwd, "name": clean(meta.get("agent_nickname") or Path(cwd).name or meta["id"]),
+            "state": None, "last": None, "created": parse_ts(meta.get("timestamp")),
+            "model": None, "effort": None, "ctx": None, "context_window": meta.get("context_window"),
+            "note": "", "bg": 0, "bg_kinds": [], "guide": None, "ledger": ""}
+    endings = {"task_started": "working", "turn_started": "working", "task_complete": "done",
+               "turn_complete": "done", "turn_aborted": "stopped", "shutdown": "stopped"}
+    context_found = False
+    for raw in reversed(lines):
+        if info["note"] and all(info[k] is not None for k in ("state", "last", "model", "effort", "ctx", "context_window")):
+            break
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("payload"), dict):
+            continue
+        payload, kind = event["payload"], event.get("type")
+        typ = payload.get("type")
+        if not isinstance(kind, str) or not isinstance(typ, (str, type(None))):
+            continue
+        if kind in ("event_msg", "response_item", "turn_context") and info["last"] is None:
+            info["last"] = parse_ts(event.get("timestamp"))
+        if kind == "turn_context" and not context_found:
+            info["model"], info["effort"] = payload.get("model"), payload.get("effort")
+            context_found = True
+        if info["state"] is None and kind in ("turn_context", "response_item"):
+            info["state"] = "done" if payload.get("phase") == "final" else "working"
+        if kind == "event_msg":
+            if info["state"] is None and typ in endings:
+                info["state"] = endings[typ]
+            usage_info = payload.get("info")
+            if typ == "token_count" and isinstance(usage_info, dict) and info["ctx"] is None:
+                usage = usage_info.get("last_token_usage")
+                if isinstance(usage, dict):
+                    tokens = [usage.get("input_tokens", 0), usage.get("output_tokens", 0)]
+                    if all(isinstance(n, (int, float)) and n >= 0 for n in tokens):
+                        info["ctx"] = sum(tokens)
+                info["context_window"] = usage_info.get("model_context_window") or info["context_window"]
+            if not info["note"]:
+                info["note"] = clean(payload.get("message") if typ in ("agent_message", "agent_reasoning")
+                                     else payload.get("last_agent_message") or "")[:200]
+        elif kind == "response_item" and not info["note"]:
+            if typ == "message" and payload.get("role") == "assistant":
+                content = payload.get("content")
+                if isinstance(content, list):
+                    info["note"] = clean(" ".join(str(b.get("text") or "") for b in content if isinstance(b, dict)))[:200]
+            elif typ in ("function_call", "custom_tool_call"):
+                info["note"] = clean(payload.get("name") or "")
+    if not context_found:
+        reusable = cached and cached[0][2] == st.st_ino and cached[0][0] <= st.st_size
+        context = cached[1] if reusable else {}
+        start = max(meta_end, cached[0][0] - MAX_TAIL_BYTES) if reusable else meta_end
+        try:
+            with path.open("rb") as fh:
+                fh.seek(start)
+                while fh.tell() < tail_start:
+                    raw = fh.readline(MAX_TAIL_BYTES)
+                    if b'"turn_context"' not in raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "turn_context" and isinstance(event.get("payload"), dict):
+                        context = event["payload"]
+        except OSError:
+            pass
+        info["model"], info["effort"] = context.get("model"), context.get("effort")
+    for key in ("model", "effort"):
+        info[key] = clean(info[key]) if info[key] else None
+    info["last"] = info["last"] or info["created"] or datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    info["created"] = info["created"] or info["last"]
+    info["state"] = info["state"] or "stopped"
+    info["search"] = " ".join(("codex", info["name"], cwd, info["note"], info["model"] or "")).lower()
+    _codex_cache[path] = (stamp, info)
+    return info
+
+
+def codex_names():
+    global _codex_names_cache
+    names = {}
+    try:
+        path = CODEX_DIR / "session_index.jsonl"
+        st = path.stat()
+        stamp = (st.st_size, st.st_mtime_ns)
+        if _codex_names_cache and _codex_names_cache[0] == stamp:
+            return _codex_names_cache[1]
+        with path.open() as fh:
+            for line in fh:
+                for entry in json_lines(line):
+                    if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry.get("thread_name"):
+                        names[entry["id"]] = clean(entry["thread_name"])
+    except (OSError, ValueError):
+        _codex_names_cache = None
+        return names
+    _codex_names_cache = (stamp, names)
+    return names
+
+
+def codex_rows():
+    rows, paths = {}, set()
+    names = codex_names()
+    for path in (CODEX_DIR / "sessions").glob("**/rollout-*.jsonl"):
+        paths.add(path)
+        info = codex_info(path)
+        if not info:
+            continue
+        row = {**info, "agents": {"total": 0, "running": 0, "models": {}, "active": []}}
+        if row["id"] in names:
+            row["name"] = names[row["id"]]
+            row["search"] += " " + row["name"].lower()
+        if row["state"] == "working" and (datetime.now(timezone.utc) - row["last"]).total_seconds() > SUBAGENT_IDLE_MINUTES * 60:
+            row["state"] = "stopped"  # a killed process may never write its turn's ending
+        rows[row["id"]] = row
+    for path in set(_codex_cache) - paths:
+        del _codex_cache[path]
+    for row in rows.values():
+        parent, seen = rows.get(row["parent"]), {row["id"]}
+        while parent and parent["parent"] in rows and parent["id"] not in seen:
+            seen.add(parent["id"])
+            parent = rows[parent["parent"]]
+        if parent is None or parent["id"] in seen:
+            continue
+        agents = parent["agents"]
+        agents["total"] += 1
+        model = clean(row["model"] or "inherit")
+        agents["models"][model] = agents["models"].get(model, 0) + 1
+        if row["state"] == "working":
+            agents["running"] += 1
+            agents["active"].append(row["name"])
+    return [r for r in rows.values() if r["parent"] not in rows or r["parent"] == r["id"]]
+
+
+def row_identity(row):
+    return row.get("provider"), row["id"]
+
+
+def attach_command(row):
+    if row.get("provider") == "codex":
+        cwd = ["-C", row["cwd"]] if row.get("cwd") else []
+        return ["codex", *cwd, "resume", row["session"]]
+    if row.get("kind") == "interactive":
+        return ["claude", "--resume", row["session"]]
+    return ["claude", "attach", row["id"]]
+
+
+def attach_directory(row):
+    return row.get("cwd") if row.get("provider") == "claude" and row.get("kind") == "interactive" else None
 
 
 def select(rows, state, text, sort, retired=False):
@@ -833,7 +1065,7 @@ def folded_count(view):
 
 
 COLUMNS = [
-    ("LAST ACTIVE", 12), ("AGO", 4), ("AGE", 4), ("STATE", 8), ("ID", 8), ("MODEL", 10), ("EFFORT", 6),
+    ("LAST ACTIVE", 12), ("AGO", 4), ("AGE", 4), ("STATE", 8), ("TOOL", 6), ("ID", 8), ("MODEL", 14), ("EFFORT", 6),
     ("RUN", 3), ("SPAWNED", 7), ("BG", 3), ("CTX", 6), ("CTX %", 10), ("NAME", 34),
 ]
 COL = {h: i for i, (h, _) in enumerate(COLUMNS)}  # column -> index into row_cells
@@ -843,11 +1075,15 @@ COL_X = {h: sum(w + 2 for _, w in COLUMNS[:i]) for i, (h, _) in enumerate(COLUMN
 def row_cells(r, now, window):
     """One cell per column; CTX % is a fraction (or None) that plain_line draws as a bar."""
     a = r["agents"]
+    context_window = r.get("context_window") if r.get("provider") == "codex" else window
+    if not isinstance(context_window, (int, float)) or context_window <= 0:
+        context_window = None
     return [
         r["last"].astimezone().strftime("%b %d %H:%M"),
         ago(r["last"], now),
         ago(r["created"], now),
         STATE_LABEL.get(r["state"], r["state"]),
+        r.get("provider", "claude"),
         r["id"],
         short_model(r["model"]),
         r["effort"] or "-",
@@ -855,7 +1091,7 @@ def row_cells(r, now, window):
         str(a["total"]) if a["total"] else "-",
         str(r["bg"]) if r["bg"] else "-",
         fmt_tokens(r["ctx"]),
-        r["ctx"] / window if r["ctx"] is not None else None,
+        r["ctx"] / context_window if r["ctx"] is not None and context_window else None,
         r["name"],
     ]
 
@@ -905,7 +1141,7 @@ def selected_detail(r):
     if r.get("group"):
         return f" {group_label(r['group'])}: " + " · ".join(f"{m['id']} {m['name']}" for m in r["rows"])
     a = r["agents"]
-    parts = [f" {r['id']}  {r['cwd']}  session {r['session']}"]
+    parts = [f" {r.get('provider', 'claude')} {r['id']}  {r['cwd']}  session {r['session']}"]
     if r["guide"] == "guide":
         parts.append("session guide" + (f", ledger {r['ledger']}" if r["ledger"] else ""))
     if r.get("guide_done"):
@@ -963,10 +1199,11 @@ HELP_USAGE = [
 HELP_COLUMNS = [
     ("LAST ACTIVE", "when the session last did something"), ("AGO", "time since then"),
     ("AGE", "time since it started"), ("STATE", "working, waiting (on you), review, done,"),
-    ("", "stopped; review = done, worktree still open"), ("ID", "job id, for claude attach"),
+    ("", "stopped; review = done, worktree still open"), ("TOOL", "claude or codex"),
+    ("ID", "job or session id; enter attaches/resumes"),
     ("MODEL", "main thread's model"), ("EFFORT", "its reasoning effort"), ("RUN", "subagents running now"),
     ("SPAWNED", "subagents started in total"), ("BG", "background shells, monitors, crons"),
-    ("CTX", "context tokens in use"), ("CTX %", "share of the context window (-w)"),
+    ("CTX", "context tokens in use"), ("CTX %", "share of window: -w, or Codex's reported size"),
     ("NAME  NOTE", "name; its question, result or step"),
     ("", "the session guide is always first"),
 ]
@@ -1048,7 +1285,7 @@ def fetch_latest(opener=None):
     """The latest release's version on GitHub, or None on any failure (offline, rate-limited, a bad reply)."""
     import urllib.request  # only the full-screen view asks, so the status line doesn't pay for the import
 
-    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": f"claude-top/{__version__}",
+    req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": f"agents-top/{__version__}",
                                                       "Accept": "application/vnd.github+json"})
     try:
         with (opener or urllib.request.urlopen)(req, timeout=3) as resp:
@@ -1075,7 +1312,7 @@ def update_check(now):
 
 
 def is_checkout(d):
-    """d is a git clone of claude-top, not some other repo the file was copied into."""
+    """d is a git clone of agents-top, not some other repo the file was copied into."""
     try:
         return (d / ".git").exists() and PACKAGE in (d / "pyproject.toml").read_text()
     except OSError:
@@ -1131,16 +1368,16 @@ def manual_update(latest):
 
 
 def restart_argv(argv=None):
-    """How to start again after an update: the claude-top command we ran as, else python and this file."""
+    """How to start again after an update: the agents-top command we ran as, else python and this file."""
     argv = sys.argv if argv is None else argv
-    if os.path.basename(argv[0]) == "claude-top" and os.path.isfile(argv[0]):
+    if os.path.basename(argv[0]) == "agents-top" and os.path.isfile(argv[0]):
         return [os.path.abspath(argv[0])] + argv[1:]
     return [sys.executable, os.path.abspath(__file__)] + argv[1:]
 
 
 def run_update(cmd, latest):
     """Run cmd in the terminal and restart into the new version. Returns only after a failure, once you press Enter."""
-    print(f"updating claude-top to {latest}: {shlex.join(cmd)}", flush=True)
+    print(f"updating agents-top to {latest}: {shlex.join(cmd)}", flush=True)
     try:
         code = subprocess.run(cmd).returncode
     except OSError as e:
@@ -1151,30 +1388,32 @@ def run_update(cmd, latest):
         try:
             os.execv(argv[0], argv)
         except OSError as e:
-            sys.exit(f"updated, but could not restart ({e}): run claude-top again")
+            sys.exit(f"updated, but could not restart ({e}): run agents-top again")
     if code:
         print(f"the update failed (exit {code}): see the output above")
     try:
-        input("press Enter to go back to claude-top, or ctrl-c to quit ")
+        input("press Enter to go back to agents-top, or ctrl-c to quit ")
     except EOFError:
         sys.exit(1)
 
 
-def attach(job_id):
-    """Open the session in this terminal (`claude attach <id>`) and wait until you leave it. Returns the note the
-    list shows when it comes back: empty after a clean exit, else what went wrong."""
-    cmd = ["claude", "attach", job_id]
+def attach(command, directory=None):
+    """Open the session in this terminal (`claude attach <id>`, `claude --resume <id>` or `codex resume <id>`) and
+    wait until you leave it. Returns the note the list shows when it comes back: empty after a clean exit, else
+    what went wrong."""
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(command, cwd=directory or None)
     except OSError as e:
-        return f" could not run `{shlex.join(cmd)}` ({e.strerror or e}): is claude on your PATH?"
+        if directory and not os.path.isdir(directory):
+            return f" could not open session directory {directory!r} ({e.strerror or e})"
+        return f" could not run `{shlex.join(command)}` ({e.strerror or e}): is {command[0]} on your PATH?"
     while True:
         try:
             code = proc.wait()
             break
-        except KeyboardInterrupt:  # ctrl-c is for the session; claude-top waits for it to end
+        except KeyboardInterrupt:  # ctrl-c is for the session; agents-top waits for it to end
             continue
-    return f" `{shlex.join(cmd)}` exited {code}" if code else ""
+    return f" `{shlex.join(command)}` exited {code}" if code else ""
 
 
 # ---------------------------------------------------------------- full screen
@@ -1237,12 +1476,12 @@ class Top:
     def relayout(self, keep=True, select_id=None):
         """Rebuild the lines from the loaded rows. The cursor stays on the selected line; when that session has
         just folded into a closed group, it moves to the group's line."""
-        selected = select_id or (self.view[self.cursor]["id"] if (keep and self.view) else None)
+        selected = select_id or (row_identity(self.view[self.cursor]) if (keep and self.view) else None)
         rows = select(self.rows, self.state, self.text, self.sort, self.retired)
         self.matched = len(rows)
         self.view = layout(rows, self.expanded, datetime.now(timezone.utc), self.idle_hours) if self.folding() else rows
-        ids = [r["id"] for r in self.view]
-        holder = next((g["id"] for g in self.view if g.get("group") and selected in [m["id"] for m in g["rows"]]), None)
+        ids = [row_identity(r) for r in self.view]
+        holder = next((row_identity(g) for g in self.view if g.get("group") and selected in [row_identity(m) for m in g["rows"]]), None)
         if selected in ids:
             self.cursor = ids.index(selected)
         elif holder:
@@ -1262,7 +1501,7 @@ class Top:
     def set_open(self, group, is_open):
         if group:
             self.expanded = self.expanded | {group} if is_open else self.expanded - {group}
-            self.relayout(select_id=f"group:{group}")
+            self.relayout(select_id=(None, f"group:{group}"))
 
     def click(self):
         """A mouse click selects the line under it, and opens or closes a group's line; the wheel moves."""
@@ -1300,7 +1539,7 @@ class Top:
         h, w = self.scr.getmaxyx()
         now = datetime.now(timezone.utc)
         sessions, agents = summary(self.rows)
-        head = f" claude-top {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
+        head = f" agents-top {__version__} {datetime.now().strftime('%H:%M:%S')} every {self.interval:g}s │ {sessions}"
         self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
         self.put(1, 0, f" {agents}".ljust(w), curses.A_REVERSE)
         legend = self.header_rows - HEADER_ROWS
@@ -1407,7 +1646,6 @@ class Top:
             self.scr.timeout(200)
 
     def run(self):
-        """What to do on leaving: ("quit", None), ("attach", job id) or ("update", (command, version))."""
         curses.curs_set(0)
         self.colors()
         if self.mouse:
@@ -1447,7 +1685,7 @@ class Top:
             elif key in (10, 13, curses.KEY_ENTER) and self.view:
                 item = self.view[self.cursor]
                 if not item.get("group"):
-                    return "attach", item["id"]
+                    return "attach", (attach_command(item), attach_directory(item))
                 self.set_open(item["group"], not item["open"])
             elif key in (curses.KEY_RIGHT, ord("l")) and self.view:
                 self.set_open(self.view[self.cursor].get("group"), True)
@@ -1460,7 +1698,10 @@ class Top:
             elif key == ord("c") and self.view and self.view[self.cursor].get("group"):
                 self.message = " a section line: enter or click opens it"
             elif key == ord("c") and self.view:
-                cmd = f"claude attach {self.view[self.cursor]['id']}"
+                row = self.view[self.cursor]
+                cmd = shlex.join(attach_command(row))
+                if attach_directory(row):
+                    cmd = f"cd {shlex.quote(attach_directory(row))} && {cmd}"
                 self.message = f" copied: {cmd}" if copy_to_clipboard(cmd) else f" {cmd}"
             elif key == ord("o"):
                 self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
@@ -1506,7 +1747,7 @@ INIT_STATE = DATA_DIR / "init.json"  # the statusLine we installed and the one i
 
 def own_command():
     """How the status line should call us: an absolute path, since it runs outside your login shell."""
-    exe = sys.argv[0] if os.path.basename(sys.argv[0]) == "claude-top" else shutil.which("claude-top")
+    exe = sys.argv[0] if os.path.basename(sys.argv[0]) == "agents-top" else shutil.which("agents-top")
     if exe and os.path.isfile(exe):
         return shlex.quote(os.path.abspath(exe))
     return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
@@ -1514,7 +1755,7 @@ def own_command():
 
 def is_ours(status_line):
     command = str((status_line or {}).get("command") or "")
-    return command == str(WRAPPER) or bool(re.search(r"claude[-_]top(\.py)?'? statusline$", command))
+    return command == str(WRAPPER) or bool(re.search(r"(?:agents-top|claude[-_]top(?:\.py)?)'? statusline$", command))
 
 
 def write_json(path, data):
@@ -1541,8 +1782,8 @@ def write_settings(settings, dry_run):
 def wrapper_script(original_command):
     return (
         "#!/bin/sh\n"
-        "# Written by `claude-top init --wrap`: records your plan limits for claude-top, then runs the status line\n"
-        "# you had before with the same input. `claude-top init --undo` puts the original back.\n"
+        "# Written by `agents-top init --wrap`: records your plan limits for agents-top, then runs the status line\n"
+        "# you had before with the same input. `agents-top init --undo` puts the original back.\n"
         'input=$(cat)\n'
         f"printf '%s' \"$input\" | {own_command()} record\n"
         f"printf '%s' \"$input\" | {original_command}\n"
@@ -1556,11 +1797,11 @@ def checklist():
     print("  claude on PATH: " + ("ok" if shutil.which("claude") else "not found: live states (working/review) need `claude agents`"))
     print("  UTF-8 terminal: " + ("ok" if "utf" in encoding else f"stdout is {encoding or 'unknown'}: the bars need a UTF-8 locale"))
     print("  the usage bars fill in after Claude Code next refreshes its status line (send it a message)")
-    print("\nnext: claude-top")
+    print("\nnext: agents-top")
 
 
 def init_main(argv):
-    ap = argparse.ArgumentParser(prog="claude-top init", description="Set claude-top as your Claude Code status line.")
+    ap = argparse.ArgumentParser(prog="agents-top init", description="Set agents-top as your Claude Code status line.")
     ap.add_argument("--wrap", action="store_true", help="keep an existing status line: run it after recording the limits")
     ap.add_argument("--dry-run", action="store_true", help="show the change without writing anything")
     ap.add_argument("--undo", action="store_true", help="put back the status line you had before init")
@@ -1582,7 +1823,7 @@ def init_main(argv):
 
     if args.undo:
         if not is_ours(current):
-            sys.exit("the status line in settings.json isn't claude-top's; nothing to undo")
+            sys.exit("the status line in settings.json isn't agents-top's; nothing to undo")
         if previous:
             settings["statusLine"] = previous
         else:
@@ -1592,16 +1833,16 @@ def init_main(argv):
             for p in (INIT_STATE, WRAPPER):
                 if p.exists():
                     p.unlink()
-            print(f"restored {json.dumps(previous)}" if previous else "removed claude-top's status line")
+            print(f"restored {json.dumps(previous)}" if previous else "removed agents-top's status line")
         return
 
     status_line = {"type": "command", "command": f"{own_command()} statusline"}
     if current and not is_ours(current):
         if not args.wrap or current.get("type") != "command" or not current.get("command"):
             print(f"settings.json already has a status line: {json.dumps(current)}")
-            print("claude-top won't replace it. Either:")
-            print("  claude-top init --wrap     record the limits, then run your status line unchanged, or")
-            print('  add `echo "$input" | claude-top record` to your own status-line script.')
+            print("agents-top won't replace it. Either:")
+            print("  agents-top init --wrap     record the limits, then run your status line unchanged, or")
+            print('  add `echo "$input" | agents-top record` to your own status-line script.')
             sys.exit(1)
         status_line = {**current, "command": str(WRAPPER)}
         script = wrapper_script(current["command"])
@@ -1631,7 +1872,7 @@ def main():
         return init_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("record", "statusline"):
         if sys.stdin.isatty():
-            sys.exit(f"claude-top {sys.argv[1]} reads Claude Code's status-line JSON on stdin; see the README")
+            sys.exit(f"agents-top {sys.argv[1]} reads Claude Code's status-line JSON on stdin; see the README")
         try:
             status_input = json.load(sys.stdin)
         except ValueError:
@@ -1643,14 +1884,14 @@ def main():
             print(statusline_text(usage, time.time()))
         return
 
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", action="version", version=f"claude-top {__version__}")
+    ap = argparse.ArgumentParser(prog="agents-top", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"agents-top {__version__}")
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default 2)")
     ap.add_argument("-s", "--state", choices=STATES[1:] + list(STATE_ALIASES),
                     help="only sessions in this state (blocked or waiting = needs your input)")
-    ap.add_argument("-g", "--grep", help="text filter: name, ask, pending question, status or folder")
+    ap.add_argument("-g", "--grep", help="text filter: name, provider, ask, pending question, status or folder")
     ap.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
-                    help=f"context window size for the CTX %% column (default {DEFAULT_WINDOW:,} tokens)")
+                    help=f"Claude context window size for CTX %% (default {DEFAULT_WINDOW:,} tokens; Codex uses its log)")
     ap.add_argument("--rate-hours", type=float, default=3.0, help="hours of history behind the 'now' speed (default 3)")
     ap.add_argument("--retired", action="store_true", help="show retired session guides (hidden by default; r toggles)")
     ap.add_argument("--expand", action="store_true", help="start with every section open (review, done, stopped, idle fold)")
@@ -1686,7 +1927,7 @@ def main():
         try:
             action, value = curses.wrapper(screen)
             if action == "attach":
-                top.message = attach(value)
+                top.message = attach(*value)
             elif action == "update":
                 run_update(*value)  # returns only if the update failed and you went back
             else:

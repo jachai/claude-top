@@ -1,6 +1,6 @@
 # Contributing
 
-Issues and pull requests are welcome. claude-top is one file, `claude_top.py`, using only the standard library and
+Issues and pull requests are welcome. agents-top is one file, `claude_top.py`, using only the standard library and
 running on Python 3.9+. Please keep it that way: no runtime dependencies and no new modules. Short functions and plain
 names are preferred over comments.
 
@@ -15,7 +15,7 @@ uv run --no-project --python 3.14 python -m unittest discover -s tests
 uvx pyflakes claude_top.py scripts tests
 ```
 
-Every test builds its own Claude config dir in a temp folder and sets `CLAUDE_TOP_LIVE=0` and
+Every test builds its own Claude config dir and `CODEX_HOME` in a temp folder and sets `CLAUDE_TOP_LIVE=0` and
 `CLAUDE_TOP_NO_UPDATE_CHECK=1`, so nothing reads your real `~/.claude`, runs `claude` or asks GitHub for updates. New
 tests should do the same.
 
@@ -29,7 +29,7 @@ uv run --no-project --with pyte --with pillow python scripts/demo.py --social do
 ```
 
 The image commands run the demo in a pseudo-terminal, read the screen with pyte and draw it with Pillow. These are
-development tools only, not dependencies of claude-top. Regenerate the images when the view changes, and look at them
+development tools only, not dependencies of agents-top. Regenerate the images when the view changes, and look at them
 before you commit. `docs/social-preview.png` is uploaded by hand under Settings → Social preview.
 
 ## Privacy

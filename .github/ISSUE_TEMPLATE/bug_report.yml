@@ -18,9 +18,9 @@ body:
     validations:
       required: true
   - type: input
-    id: claude-top-version
+    id: agents-top-version
     attributes:
-      label: "`claude-top --version`"
+      label: "`agents-top --version`"
     validations:
       required: true
   - type: input
@@ -33,6 +33,6 @@ body:
   - type: textarea
     id: once
     attributes:
-      label: "`claude-top --once` output (redacted)"
+      label: "`agents-top --once` output (redacted)"
       description: Replace session names, notes and folders with placeholders.
       render: text

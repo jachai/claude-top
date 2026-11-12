@@ -1,4 +1,4 @@
-"""claude-top tests.
+"""agents-top tests.
 
 Every test builds its own Claude config dir (state.json, transcripts, subagent metas, rate-limit
 snapshot, history) under a temp HOME, never runs `claude` (CLAUDE_TOP_LIVE=0, live data is passed in) and never
@@ -58,7 +58,7 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
         self.config = self.home / ".claude"
-        self.env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CLAUDE_TOP_LIVE": "0",
+        self.env = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_TOP_LIVE": "0",
                     "CLAUDE_TOP_NO_UPDATE_CHECK": "1"}
         patcher = mock.patch.dict(os.environ, self.env)
         patcher.start()
@@ -290,7 +290,223 @@ class TranscriptTest(Sandbox):
         self.assertEqual(self.ct.short_model(None), "-")
 
 
+class CodexTest(Sandbox):
+    def rollout(self, sid="codex-session", events=(), parent=None, age=0):
+        path = self.home / ".codex" / "sessions" / "2026" / "10" / "26" / f"rollout-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {"id": sid, "cwd": "/home/dev/example", "timestamp": iso(self.now - H),
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent}}} if parent else "cli"}
+        records = [{"type": "session_meta", "timestamp": iso(self.now - H), "payload": meta}]
+        records += [{"timestamp": iso(self.now - age), "type": kind, "payload": payload} for kind, payload in events]
+        path.write_text("".join(json.dumps(e) + "\n" for e in records))
+        os.utime(path, (self.now - age, self.now - age))
+        return path
+
+    def test_codex_and_claude_share_the_table(self):
+        self.working_session()
+        self.rollout(events=[
+            ("event_msg", {"type": "task_started"}),
+            ("turn_context", {"model": "gpt-5.3-codex", "effort": "high"}),
+            ("event_msg", {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 40000, "cached_input_tokens": 30000, "output_tokens": 500},
+                "total_token_usage": {"total_tokens": 900000}, "model_context_window": 200000}}),
+            ("response_item", {"type": "message", "role": "assistant", "phase": "commentary",
+                               "content": [{"type": "output_text", "text": "Running tests"}]})])
+        rows = self.rows()
+        self.assertEqual(set(rows), {"job1", "codex-session"})
+        row = rows["codex-session"]
+        self.assertEqual((row["provider"], row["state"], row["model"], row["effort"], row["ctx"]),
+                         ("codex", "working", "gpt-5.3-codex", "high", 40500))
+        cells = self.ct.row_cells(row, datetime.now(timezone.utc), 1000000)
+        self.assertAlmostEqual(cells[self.ct.COL["CTX %"]], 40500 / 200000)
+        self.assertEqual(cells[self.ct.COL["MODEL"]], "gpt-5.3-codex")
+        self.assertEqual(cells[self.ct.COL["TOOL"]], "codex")
+        self.assertIn("Running tests", row["note"])
+        self.assertEqual(self.ct.select(list(rows.values()), None, "codex", "name"), [row])
+
+    def test_turn_completion_abort_and_stale_start(self):
+        for sid, ending, state in (("done", "task_complete", "done"), ("stopped", "turn_aborted", "stopped"),
+                                    ("old", "task_started", "stopped"), ("legacy", "turn_complete", "done")):
+            self.rollout(sid, [("event_msg", {"type": "task_started"}), ("event_msg", {"type": ending})],
+                         age=3600 if sid == "old" else 0)
+            self.assertEqual(self.rows()[sid]["state"], state)
+
+    def test_children_are_counted_under_the_parent(self):
+        self.rollout("parent", [("event_msg", {"type": "task_started"})])
+        self.rollout("child", [("event_msg", {"type": "task_started"})], parent="parent")
+        self.rollout("finished", [("event_msg", {"type": "task_complete"})], parent="parent")
+        rows = self.rows()
+        self.assertEqual(set(rows), {"parent"})
+        self.assertEqual((rows["parent"]["agents"]["running"], rows["parent"]["agents"]["total"]), (1, 2))
+
+    def test_corrupt_records_archives_and_refresh(self):
+        path = self.rollout(events=[("event_msg", {"type": "task_started"})])
+        archive = self.home / ".codex" / "archived_sessions"
+        archive.mkdir()
+        (archive / "rollout-archived.jsonl").write_bytes(path.read_bytes())
+        with path.open("a") as f:
+            f.write('null\n[]\n{"type":"event_msg","payload":[]}\n{broken\n')
+        self.assertEqual(self.rows()["codex-session"]["state"], "working")
+        with path.open("a") as f:
+            f.write(json.dumps({"timestamp": iso(self.now + 2), "type": "event_msg",
+                                "payload": {"type": "task_complete"}}) + "\n")
+        self.assertEqual(self.rows()["codex-session"]["state"], "done")
+        path.unlink()
+        self.assertEqual(self.rows(), {})
+
+    def test_resume_commands_keep_full_id_and_quote_folder(self):
+        row = {"provider": "codex", "session": "12345678-full-session", "id": "12345678-full-session",
+               "cwd": "/home/dev/a project"}
+        command = self.ct.attach_command(row)
+        self.assertEqual(command, ["codex", "-C", "/home/dev/a project", "resume", "12345678-full-session"])
+        self.assertEqual(shlex.split(shlex.join(command)), command)
+        self.assertEqual(self.ct.attach_command({"id": "claude-job"}), ["claude", "attach", "claude-job"])
+
+    def test_saved_names_refresh_and_cli_output(self):
+        self.rollout(events=[("event_msg", {"type": "task_complete"})])
+        index = self.home / ".codex" / "session_index.jsonl"
+        index.write_text(json.dumps({"id": "codex-session", "thread_name": "Review the parser"}) + "\n")
+        self.assertEqual(self.rows()["codex-session"]["name"], "Review the parser")
+        with index.open("a") as f:
+            f.write(json.dumps({"id": "codex-session", "thread_name": "Updated title"}) + "\n")
+        out = subprocess.run([sys.executable, str(ROOT / "claude_top.py"), "--once", "-g", "codex"],
+                             capture_output=True, text=True, env=os.environ.copy(), check=True)
+        self.assertIn("codex", out.stdout)
+        self.assertIn("Updated title", out.stdout)
+        self.assertIn("Claude 5h", out.stdout)
+        self.assertEqual(self.rows()["codex-session"]["name"], "Updated title")
+
+    def test_large_logs_keep_model_and_infer_active_turn_from_tail(self):
+        path = self.rollout(events=[("turn_context", {"model": "gpt-5.3-codex", "effort": "high"}),
+                                    ("event_msg", {"type": "task_complete"}),
+                                    ("event_msg", {"type": "task_started"})])
+        record = json.dumps({"timestamp": iso(self.now), "type": "response_item",
+                             "payload": {"type": "reasoning", "summary": "x" * 10000}}) + "\n"
+        with path.open("a") as f:
+            for _ in range(250):
+                f.write(record)
+        row = self.rows()["codex-session"]
+        self.assertEqual((row["state"], row["model"], row["effort"]), ("working", "gpt-5.3-codex", "high"))
+
+    def test_grandchildren_count_under_root(self):
+        self.rollout("root", [("event_msg", {"type": "task_started"})])
+        self.rollout("child", [("event_msg", {"type": "task_started"})], parent="root")
+        self.rollout("grandchild", [("event_msg", {"type": "task_started"})], parent="child")
+        rows = self.rows()
+        self.assertEqual(set(rows), {"root"})
+        self.assertEqual(rows["root"]["agents"]["running"], 2)
+
+    def test_model_switch_in_middle_of_large_rollout_is_current(self):
+        path = self.rollout(events=[("turn_context", {"model": "old-model", "effort": "low"})])
+        filler = json.dumps({"timestamp": iso(self.now), "type": "response_item",
+                             "payload": {"type": "reasoning", "summary": "x" * 10000}}) + "\n"
+        with path.open("a") as f:
+            f.write(filler * 80)
+            f.write(json.dumps({"timestamp": iso(self.now), "type": "turn_context",
+                                "payload": {"model": "new-model", "effort": "high"}}) + "\n")
+            f.write(filler * 250)
+        row = self.rows()["codex-session"]
+        self.assertEqual((row["model"], row["effort"]), ("new-model", "high"))
+        with path.open("a") as f:
+            f.write(filler)
+        row = self.rows()["codex-session"]
+        self.assertEqual((row["model"], row["effort"]), ("new-model", "high"))
+
+    def test_unknown_context_window_stays_blank_and_staleness_expires_cached_row(self):
+        self.rollout(events=[("event_msg", {"type": "task_started"}),
+                             ("event_msg", {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1500}}})])
+        row = self.rows()["codex-session"]
+        cells = self.ct.row_cells(row, datetime.now(timezone.utc), 1000000)
+        self.assertIsNone(cells[self.ct.COL["CTX %"]])
+        with mock.patch.object(self.ct, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime.fromtimestamp(self.now + 3600, tz=timezone.utc)
+            self.assertEqual(self.rows()["codex-session"]["state"], "stopped")
+
+    def test_selection_keeps_provider_when_sorting_and_folding(self):
+        self.working_session("shared", "claude-session")
+        self.rollout("shared", [("event_msg", {"type": "task_started"})])
+        args = mock.Mock(interval=2, window=1000000, state=None, grep=None, retired=False,
+                         expand=False, idle_hours=24, no_mouse=True, rate_hours=3)
+        top = self.ct.Top(None, args)
+        top.rows = self.ct.load_rows({})
+        top.relayout(keep=False)
+        top.cursor = next(i for i, row in enumerate(top.view) if row.get("provider") == "codex")
+        top.sort = "name"
+        top.relayout()
+        selected = top.view[top.cursor]
+        self.assertEqual((selected["provider"], selected["id"]), ("codex", "shared"))
+        selected["state"] = "done"
+        top.relayout()
+        self.assertEqual(top.view[top.cursor]["group"], "done")
+        top.set_open("done", True)
+        self.assertEqual(top.view[top.cursor]["group"], "done")
+        self.assertEqual(top.view[top.cursor + 1]["provider"], "codex")
+        top.cursor += 1
+        top.set_open("done", False)
+        self.assertEqual(top.view[top.cursor]["group"], "done")
+
+    @unittest.skipUnless(claude_top.curses, "needs curses")
+    def test_main_runs_provider_command_and_returns_to_the_list(self):
+        command = ["codex", "-C", "/home/dev/a project", "resume", "full-session-id"]
+        results = iter([("attach", (command, None)), ("quit", None)])
+        with mock.patch.object(sys, "argv", ["agents-top"]), mock.patch.object(sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(self.ct.curses, "wrapper", side_effect=lambda fn: fn(object())), \
+                mock.patch.object(self.ct.Top, "run", lambda top: next(results)), \
+                mock.patch.object(self.ct, "attach", return_value="") as attach:
+            self.ct.main()
+        attach.assert_called_once_with(command, None)
+
+
 class RowsTest(Sandbox):
+    def registry(self, sid="interactive-1", **fields):
+        entry = {"pid": os.getpid(), "sessionId": sid, "kind": "interactive", "status": "idle",
+                 "cwd": "/tmp/app", "name": "Current shell", "startedAt": int((self.now - H) * 1000),
+                 "updatedAt": int((self.now - 10) * 1000), **fields}
+        path = self.config / "sessions" / f"{sid}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entry))
+
+    def test_registered_interactive_session_is_found_without_agents_cli(self):
+        self.registry()
+        self.transcript("interactive-1", [api_request(), assistant(1000, at=self.now - 5)])
+        row = self.rows()["interactive-1"]
+        self.assertEqual((row["kind"], row["state"], row["name"], row["cwd"]),
+                         ("interactive", "blocked", "Current shell", "/tmp/app"))
+        self.assertAlmostEqual(row["created"].timestamp(), self.now - H, delta=1)
+        self.assertAlmostEqual(row["last"].timestamp(), self.now - 5, delta=1)
+        self.assertEqual(self.ct.attach_command(row), ["claude", "--resume", "interactive-1"])
+
+    def test_registered_session_without_transcript_uses_registry_status_and_time(self):
+        self.registry(status="busy")
+        row = self.rows()["interactive-1"]
+        self.assertEqual(row["state"], "working")
+        self.assertAlmostEqual(row["last"].timestamp(), self.now - 10, delta=1)
+
+    def test_registry_does_not_duplicate_jobs_or_override_live_state(self):
+        self.registry("s1")
+        self.working_session("job1", "s1")
+        rows = self.rows({"job1": {"id": "job1", "sessionId": "s1", "kind": "background",
+                                  "state": "working", "name": "Live name"}})
+        self.assertEqual(list(rows), ["job1"])
+        self.assertEqual((rows["job1"]["state"], rows["job1"]["name"]), ("working", "Live name"))
+        self.assertEqual(list(self.rows()), ["job1"])
+        self.assertAlmostEqual(self.rows()["job1"]["last"].timestamp(), self.now, delta=1)
+
+    def test_dead_or_invalid_registry_records_are_ignored(self):
+        self.registry("dead")
+        with mock.patch.object(self.ct.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.rows(), {})
+        self.registry("dead", pid=None)
+        self.registry("missing-id", sessionId=None)
+        self.registry("bad-time", updatedAt=1e100)
+        (self.config / "sessions" / "broken.json").write_text("[1,2]")
+        self.assertEqual(self.rows(), {})
+
+    def test_live_background_session_is_found_before_state_file_exists(self):
+        live = {"new": {"id": "new", "kind": "background", "state": "working",
+                        "startedAt": int(self.now * 1000)}}
+        self.assertEqual(self.rows(live)["new"]["state"], "working")
+
     def test_last_active_is_the_last_message_not_the_file_time(self):
         # finished sessions' transcripts keep getting bookkeeping lines (no timestamp, no conversation),
         # which bumps the file's mtime; last active must stay at the last real message
@@ -553,7 +769,7 @@ class CliTest(Sandbox):
         self.assertEqual(note[len(shown) - 1], " ")  # the cut is at a word boundary
 
     def test_once_without_usage_data_says_how_to_get_it(self):
-        self.assertIn("claude-top init", self.run_cli("--once").stdout)
+        self.assertIn("agents-top init", self.run_cli("--once").stdout)
 
     def test_statusline_records_and_prints(self):
         status = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 38, "resets_at": self.now + 3 * H},
@@ -585,7 +801,7 @@ class CliTest(Sandbox):
 
     def test_version(self):
         out = self.run_cli("--version")
-        self.assertEqual(out.stdout.strip(), f"claude-top {self.ct.__version__}")
+        self.assertEqual(out.stdout.strip(), f"agents-top {self.ct.__version__}")
 
 
 class HelpTest(unittest.TestCase):
@@ -684,7 +900,7 @@ class ScreenTest(Sandbox):
             try:
                 os.write(fd, key)
             except OSError:
-                self.fail(f"claude-top exited before {key!r}: {bytes(out[-800:])!r}")
+                self.fail(f"agents-top exited before {key!r}: {bytes(out[-800:])!r}")
             pump(0.2)
         for _ in range(50):
             done, status = os.waitpid(pid, os.WNOHANG)
@@ -694,7 +910,7 @@ class ScreenTest(Sandbox):
         else:
             os.kill(pid, 9)
             os.waitpid(pid, 0)
-            self.fail(f"claude-top did not quit: {bytes(out[-500:])!r}")
+            self.fail(f"agents-top did not quit: {bytes(out[-500:])!r}")
         os.close(fd)
         text = bytes(out).decode(errors="replace")
         self.assertNotIn("Traceback", text)
@@ -730,12 +946,41 @@ class ScreenTest(Sandbox):
             self.assertIn(word, text)
         self.assertIn("manager", self.run_screen(24, 80, [b"q"]))  # its own row: it fits a small terminal
 
+    def launchers(self):
+        folder = self.home / "bin"
+        folder.mkdir()
+        for provider in ("claude", "codex"):
+            path = folder / provider
+            path.write_text(f"#!{sys.executable}\nimport os, sys\nprint('LAUNCHED', {provider!r}, repr(sys.argv[1:]))\nprint('CWD', os.getcwd())\n")
+            path.chmod(0o755)
+        return {"PATH": str(folder)}
+
+    def test_enter_on_codex_row_launches_codex_after_refresh(self):
+        self.working_session()
+        path = self.home / ".codex" / "sessions" / "rollout-codex-test.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "codex-test", "cwd": str(self.home), "timestamp": iso(self.now - H)}}) + "\n")
+        text = self.run_screen(24, 220, [b"G", b"\n", b"j", b" ", b"\n", b"q"], self.launchers())
+        self.assertIn(f"LAUNCHED codex ['-C', '{self.home}', 'resume', 'codex-test']", text)
+        self.assertNotIn("LAUNCHED claude", text)
+
+    def test_enter_on_interactive_claude_resumes_in_project_directory(self):
+        directory = self.config / "sessions"
+        directory.mkdir(parents=True)
+        (directory / "session.json").write_text(json.dumps({
+            "sessionId": "interactive-test", "pid": os.getpid(), "kind": "interactive",
+            "cwd": str(self.home), "status": "idle", "startedAt": int(self.now * 1000)}))
+        text = self.run_screen(24, 220, [b"j", b"\n", b"q"], self.launchers())
+        self.assertIn("LAUNCHED claude ['--resume', 'interactive-test']", text)
+        self.assertIn(f"CWD {self.home.resolve()}", text)
+
     def test_cached_newer_release_is_offered_and_n_declines(self):
         self.ct.DATA_DIR.mkdir(parents=True)
         self.ct.UPDATE_CHECK.write_text(json.dumps({"checked": int(self.now), "latest": "9.9.9"}))
         env = {"CLAUDE_TOP_NO_UPDATE_CHECK": "0", "HTTPS_PROXY": "http://127.0.0.1:9"}  # a fresh cache: no request
         text = self.run_screen(24, 80, [b"u", b"n", b"?", b"x", b"q"], env)
-        self.assertIn(f"claude-top {self.ct.__version__} ", text)
+        self.assertIn(f"agents-top {self.ct.__version__} ", text)
         self.assertIn("u update to 9.9.9", text)
         self.assertIn("update to 9.9.9? y/n  $ git -C ", text)
         self.assertEqual(json.loads(self.ct.UPDATE_CHECK.read_text())["checked"], int(self.now))
@@ -863,7 +1108,7 @@ class UpdateTest(Sandbox):
 
         self.assertEqual(self.fetch_latest(opener), "0.4.0")
         self.assertEqual(seen["url"], "https://api.github.com/repos/jachai/claude-top/releases/latest")
-        self.assertTrue(seen["agent"].startswith("claude-top/"))
+        self.assertTrue(seen["agent"].startswith("agents-top/"))
         self.assertLessEqual(seen["timeout"], 5)
 
     def test_fetch_failures_are_silent(self):
@@ -882,14 +1127,14 @@ class UpdateTest(Sandbox):
             self.assertIsNone(self.fetch_latest(opener))
 
     def test_once_never_checks(self):
-        argv = ["claude-top", "--once"]
+        argv = ["agents-top", "--once"]
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
             self.ct.main()
         self.fetch.assert_not_called()
         self.assertFalse(self.ct.UPDATE_CHECK.exists())
 
     def test_install_method_picks_the_command(self):
-        checkout = self.home.resolve() / "src" / "claude-top"
+        checkout = self.home.resolve() / "src" / "agents-top"
         (checkout / ".git").mkdir(parents=True)
         (checkout / "pyproject.toml").write_text('name = "claude-agents-top"\n')
         site = "lib/python3.12/site-packages/claude_top.py"
@@ -916,7 +1161,7 @@ class UpdateTest(Sandbox):
         self.assertEqual(prompt, " update to 0.4.0? y/n  $ git -C '/my dir' pull --ff-only")
 
     def test_restart_uses_the_command_it_was_run_as(self):
-        exe = self.home / "bin" / "claude-top"
+        exe = self.home / "bin" / "agents-top"
         exe.parent.mkdir()
         exe.write_text("#!/bin/sh\n")
         self.assertEqual(self.ct.restart_argv([str(exe), "-s", "waiting"]), [str(exe), "-s", "waiting"])
@@ -954,12 +1199,12 @@ class AttachTest(Sandbox):
 
     def test_attach_waits_and_reports_how_it_ended(self):
         with self.fake_claude(0):
-            self.assertEqual(self.ct.attach("job 1"), "")
+            self.assertEqual(self.ct.attach(["claude", "attach", "job 1"]), "")
         self.assertEqual((self.home / "argv").read_text(), "attach job 1\n")
         with self.fake_claude(3):
-            self.assertEqual(self.ct.attach("job1"), " `claude attach job1` exited 3")
+            self.assertEqual(self.ct.attach(["claude", "attach", "job1"]), " `claude attach job1` exited 3")
         with mock.patch.dict(os.environ, {"PATH": str(self.home / "empty")}):
-            note = self.ct.attach("job1")
+            note = self.ct.attach(["claude", "attach", "job1"])
         self.assertTrue(note.startswith(" could not run `claude attach job1`"), note)
         self.assertTrue(note.endswith("is claude on your PATH?"), note)
 
@@ -967,14 +1212,14 @@ class AttachTest(Sandbox):
         proc = mock.Mock()
         proc.wait.side_effect = [KeyboardInterrupt, 0]
         with mock.patch.object(self.ct.subprocess, "Popen", return_value=proc):
-            self.assertEqual(self.ct.attach("job1"), "")
+            self.assertEqual(self.ct.attach(["claude", "attach", "job1"]), "")
         self.assertEqual(proc.wait.call_count, 2)
         proc.kill.assert_not_called()
 
     @unittest.skipIf(claude_top.curses is None, "no curses")
     def test_leaving_a_session_reopens_the_same_list(self):
         screens, seen = [object(), object()], []
-        results = iter([("attach", "job1"), ("quit", None)])
+        results = iter([("attach", (["claude", "attach", "job1"], None)), ("quit", None)])
 
         def run(top):
             seen.append((top, top.scr, top.message))
@@ -985,7 +1230,7 @@ class AttachTest(Sandbox):
                 mock.patch.object(self.ct.Top, "run", run), \
                 mock.patch.object(self.ct, "attach", return_value=" `claude attach job1` exited 1") as attach:
             self.ct.main()
-        attach.assert_called_once_with("job1")
+        attach.assert_called_once_with(["claude", "attach", "job1"], None)
         (first, scr1, _), (second, scr2, note) = seen
         self.assertIs(first, second)  # same cursor, filters, sort and open sections
         self.assertEqual((scr1, scr2), tuple(screens))
@@ -1022,7 +1267,7 @@ class InitTest(Sandbox):
         self.assertEqual(code, 0)
         self.assertEqual(self.read(), {"statusLine": {"type": "command", "command": f"{self.command} statusline"}})
         self.assertEqual(self.backups(), [])  # nothing to back up
-        self.assertIn("next: claude-top", out)
+        self.assertIn("next: agents-top", out)
         self.assertIn("claude on PATH", out)
 
     def test_other_settings_and_formatting_are_kept(self):
@@ -1043,6 +1288,19 @@ class InitTest(Sandbox):
         self.assertIn("already set up", out)
         self.assertEqual(self.backups(), [])
 
+    def test_renamed_command_preserves_original_status_line_for_undo(self):
+        original = {"type": "command", "command": "~/my-status.sh"}
+        self.config.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "/bin/claude-top statusline"}}))
+        self.ct.DATA_DIR.mkdir()
+        self.ct.INIT_STATE.write_text(json.dumps({"previous": original}))
+        self.command = "/bin/agents-top"
+        self.assertEqual(self.init()[0], 0)
+        self.assertEqual(self.read()["statusLine"]["command"], "/bin/agents-top statusline")
+        self.assertIn("already set up", self.init()[1])
+        self.assertEqual(self.init("--undo")[0], 0)
+        self.assertEqual(self.read()["statusLine"], original)
+
     def test_foreign_status_line_is_never_replaced_without_wrap(self):
         self.config.mkdir(parents=True)
         self.settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/my-status.sh"}}, indent=2))
@@ -1050,7 +1308,7 @@ class InitTest(Sandbox):
         code, out = self.init()
         self.assertEqual((code, self.settings.read_bytes()), (1, before))
         self.assertIn("--wrap", out)
-        self.assertIn('claude-top record', out)
+        self.assertIn('agents-top record', out)
         self.assertEqual(self.backups(), [])
 
     def test_wrap_runs_both_with_the_same_input(self):

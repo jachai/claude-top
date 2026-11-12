@@ -3,15 +3,15 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# `claude-top` on PyPI is an unrelated project; the command this installs is still `claude-top`
+# `claude-top` on PyPI is an unrelated project; the command is `agents-top`, with `claude-top` kept as an alias
 name = "claude-agents-top"
 dynamic = ["version"]
-description = "A top-style live view of your Claude Code background sessions and plan usage"
+description = "A top-style live view of Claude Code and Codex sessions, with Claude plan usage"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["claude", "claude-code", "top", "tui", "monitor"]
+keywords = ["claude", "claude-code", "codex", "top", "tui", "monitor"]
 classifiers = [
   "Environment :: Console :: Curses",
   "Operating System :: MacOS",
@@ -33,6 +33,7 @@ Issues = "https://github.com/jachai/claude-top/issues"
 Changelog = "https://github.com/jachai/claude-top/blob/main/CHANGELOG.md"
 
 [project.scripts]
+agents-top = "claude_top:main"
 claude-top = "claude_top:main"
 
 [tool.setuptools]
