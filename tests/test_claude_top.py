@@ -284,6 +284,17 @@ class TranscriptTest(Sandbox):
         with mock.patch.dict(os.environ, {"AGENT_GUARD_HOME": str(guard)}):
             self.assertEqual(self.ct.guard_window(), 150_000)
 
+    def test_row_window_per_kind_and_override(self):
+        guard = self.home / "g2"
+        guard.mkdir()
+        (guard / "config.json").write_text('{"context_ask_tokens": 200000, "guide_context_ask_tokens": 500000,'
+                                           ' "helper_context_ask_tokens": 150000}')
+        with mock.patch.dict(os.environ, {"AGENT_GUARD_HOME": str(guard)}):
+            self.assertEqual(self.ct.row_window({"guide": "guide", "kind": "background"}), 500_000)
+            self.assertEqual(self.ct.row_window({"guide": None, "kind": "subagent"}), 150_000)
+            self.assertEqual(self.ct.row_window({"guide": None, "kind": "background"}), 200_000)
+            self.assertEqual(self.ct.row_window({"guide": "guide", "kind": "background"}, 1_000_000), 1_000_000)
+
     def test_short_model(self):
         self.assertEqual(self.ct.short_model("claude-opus-5-5"), "opus 5.5")
         self.assertEqual(self.ct.short_model("claude-opus-4-1-20250805"), "opus 4.1")

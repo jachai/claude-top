@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-11-16
+
+### Fixed
+
+- CTX % divides each row by its own agent-guard limit: `guide_context_ask_tokens` (500k) for a session-guide, `helper_context_ask_tokens`
+  (150k) for a subagent, `context_ask_tokens` (200k) otherwise. The guide showed 163% at 326k. `-w` and
+  `CLAUDE_TOP_CONTEXT_WINDOW` still override every row.
+
 ## [0.6.3] - 2026-11-08
 
 ### Fixed

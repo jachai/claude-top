@@ -47,7 +47,7 @@ try:
 except ImportError:  # Windows: only --once works
     curses = None
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 JOBS = CLAUDE_DIR / "jobs"
@@ -70,20 +70,43 @@ TAIL_BYTES = 512 * 1024
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 
 
-def guard_window():
-    """agent-guard's context_ask_tokens (the limit it stops a session at), else 200k."""
+def guard_limits():
+    """agent-guard's token limits: (session, guide, helper) = context_ask_tokens (200k), guide_ (500k), helper_ (150k)."""
     home = os.environ.get("AGENT_GUARD_HOME") or os.path.expanduser("~/.agent-guard")
     try:
         with open(os.path.join(home, "config.json")) as fh:
-            value = int(json.load(fh)["context_ask_tokens"])
-        if value > 0:
-            return value
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return 200_000
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    out = []
+    for key, default in (("context_ask_tokens", 200_000), ("guide_context_ask_tokens", 500_000),
+                         ("helper_context_ask_tokens", 150_000)):
+        try:
+            value = int(cfg[key])
+        except (KeyError, ValueError, TypeError):
+            value = 0
+        out.append(value if value > 0 else default)
+    return tuple(out)
 
 
-DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or guard_window())
+def guard_window():
+    """agent-guard's context_ask_tokens (the limit it stops a session at), else 200k."""
+    return guard_limits()[0]
+
+
+def row_window(r, override=None):
+    """The window a row's CTX % divides by: -w / CLAUDE_TOP_CONTEXT_WINDOW, else its agent-guard limit."""
+    if override:
+        return override
+    session, guide, helper = guard_limits()
+    if r.get("guide") == "guide":
+        return guide
+    return helper if "subagent" in str(r.get("kind") or "") else session
+
+
+DEFAULT_WINDOW = int(os.environ.get("CLAUDE_TOP_CONTEXT_WINDOW") or 0) or None  # None: each row uses its own limit
 SUBAGENT_IDLE_MINUTES = 15
 IDLE_HOURS = float(os.environ.get("CLAUDE_TOP_IDLE_HOURS") or 24)
 
@@ -855,7 +878,7 @@ def row_cells(r, now, window):
         str(a["total"]) if a["total"] else "-",
         str(r["bg"]) if r["bg"] else "-",
         fmt_tokens(r["ctx"]),
-        r["ctx"] / window if r["ctx"] is not None else None,
+        r["ctx"] / row_window(r, window) if r["ctx"] is not None else None,
         r["name"],
     ]
 
@@ -1650,7 +1673,8 @@ def main():
                     help="only sessions in this state (blocked or waiting = needs your input)")
     ap.add_argument("-g", "--grep", help="text filter: name, ask, pending question, status or folder")
     ap.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
-                    help=f"context window size for the CTX %% column (default {DEFAULT_WINDOW:,} tokens)")
+                    help="context window for the CTX %% column (default: agent-guard's limit per session: "
+                         "%d, guide %d, helper %d)" % guard_limits())
     ap.add_argument("--rate-hours", type=float, default=3.0, help="hours of history behind the 'now' speed (default 3)")
     ap.add_argument("--retired", action="store_true", help="show retired session guides (hidden by default; r toggles)")
     ap.add_argument("--expand", action="store_true", help="start with every section open (review, done, stopped, idle fold)")
@@ -1660,7 +1684,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="print once and exit")
     ap.add_argument("-n", type=int, default=30, help="with --once: rows to print (0 = all)")
     args = ap.parse_args()
-    if args.window <= 0:
+    if args.window is not None and args.window <= 0:
         ap.error("--window must be a positive number of tokens")
     if args.idle_hours <= 0:
         ap.error("--idle-hours must be a positive number of hours")
