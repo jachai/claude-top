@@ -529,10 +529,22 @@ class RowsTest(Sandbox):
         self.assertEqual(agents, "agents now 2 (1 sess + 1 sub) │ spawned 1 (1 live) │ bg 0")
 
 
+class WorkerMarkTest(Sandbox):
+    def test_closed_name_strips_scoped_guided_mark(self):
+        self.assertEqual(self.ct.closed_name("\U0001f7e7\U0001f7e7 (g\u00b7hub) job"), "\u2705 job")
+        self.assertEqual(self.ct.closed_name("\U0001f7e7\U0001f7e7 (g) job"), "\u2705 job")
+        self.assertEqual(self.ct.closed_name("(g\u00b7hub) job"), "\u2705 job")
+
+
 class CliTest(Sandbox):
     def run_cli(self, *argv, stdin=None):
         return subprocess.run([sys.executable, str(ROOT / "claude_top.py"), *argv], input=stdin, capture_output=True,
                               text=True, env={**os.environ, **self.env, "COLUMNS": "200"})
+
+    def test_help_prints(self):
+        r = self.run_cli("--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CTX % column", r.stdout)
 
     def test_once_prints_summary_usage_and_rows(self):
         self.state("w1", state="working", name="writer", needs="")
