@@ -52,6 +52,18 @@ def tool_use(description):
     return {"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": description}}
 
 
+class HelpAndMarkTest(unittest.TestCase):
+    def test_help_prints(self):
+        r = subprocess.run([sys.executable, str(ROOT / "claude_top.py"), "--help"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CTX % column", r.stdout)
+
+    def test_closed_name_strips_scoped_guided_mark(self):
+        self.assertEqual(claude_top.closed_name("\U0001f7e7\U0001f7e7 (g\u00b7hub) job"), "\u2705 job")
+        self.assertEqual(claude_top.closed_name("\U0001f7e7\U0001f7e7 (g) job"), "\u2705 job")
+        self.assertEqual(claude_top.closed_name("(g\u00b7hub) job"), "\u2705 job")
+
+
 class Sandbox(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

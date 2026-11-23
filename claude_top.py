@@ -636,7 +636,7 @@ def ledger_done(path):
     return done
 
 
-WORKER_MARK = re.compile("^(?:\U0001f7e7\U0001f7e7 \\(g\\)|\\(g\\)|\u2b1c\u2b1c|\U0001f7e6\U0001f7e6|\u2705)\\s*")
+WORKER_MARK = re.compile("^(?:\U0001f7e7\U0001f7e7 \\(g(?:\u00b7[^()\\s]+)?\\)|\\(g(?:\u00b7[^()\\s]+)?\\)|\u2b1c\u2b1c|\U0001f7e6\U0001f7e6|\u2705)\\s*")
 
 
 def closed_name(name):
@@ -1673,7 +1673,7 @@ def main():
                     help="only sessions in this state (blocked or waiting = needs your input)")
     ap.add_argument("-g", "--grep", help="text filter: name, ask, pending question, status or folder")
     ap.add_argument("-w", "--window", type=int, default=DEFAULT_WINDOW,
-                    help="context window for the CTX %% column (default: agent-guard's limit per session: "
+                    help="context window for the CTX %%%% column (default: agent-guard's limit per session: "
                          "%d, guide %d, helper %d)" % guard_limits())
     ap.add_argument("--rate-hours", type=float, default=3.0, help="hours of history behind the 'now' speed (default 3)")
     ap.add_argument("--retired", action="store_true", help="show retired session guides (hidden by default; r toggles)")
